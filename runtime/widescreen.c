@@ -80,11 +80,12 @@ static int g_fpscap = 60;           /* frame-rate cap; 0 = uncapped */
 static int g_vsync = -1;            /* -1 auto, 0 off, 1 force vsync-every-frame */
 static int g_backbuffers = 2;       /* backbuffer count (2 => triple-buffered);
                                      * breaks the CPU<->GPU serialization stall */
-static int g_pf_fullres = 0;        /* 1 => patch PostFilterLOD to a fractional
-                                     * value so the post-filter renders near
-                                     * full-res without a 2x backbuffer */
-static float g_pf_scale = 0.5f;     /* the fractional LOD to store (smaller =
-                                     * higher post-filter resolution) */
+static int g_pf_fullres = 0;        /* 1 => patch the post-filter buffers to full
+                                     * backbuffer resolution (no ÷2) */
+static float g_pf_scale = 0.5f;     /* unused; kept for ini backward-compat */
+static int g_force_winmouse = -1;   /* force the Windows mouse path (working
+                                     * buttons under winemac): -1 auto (Wine),
+                                     * 0 off, 1 always */
 static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
 static D3DFORMAT g_desktop_fmt = D3DFMT_X8R8G8B8; /* desktop backbuffer format */
 static int g_caps_done;             /* caps queried yet? */
@@ -156,6 +157,9 @@ static void read_config(void)
         else if (sscanf(line, " PostFilterScale = %f", &v) == 1 ||
                  sscanf(line, " PostFilterScale=%f", &v) == 1)
             g_pf_scale = v;
+        else if (sscanf(line, " ForceWinMouse = %d", &b) == 1 ||
+                 sscanf(line, " ForceWinMouse=%d", &b) == 1)
+            g_force_winmouse = b < 0 ? -1 : (b != 0);
     }
     fclose(f);
     if (g_backbuffers < 0 || g_backbuffers > 3) g_backbuffers = 2;
@@ -318,6 +322,45 @@ static void patch_postfilter_fullres(void)
     logf_("PostFilterFullRes: %d/6 post-buffer ÷2 sites NOPed — post-filter "
           "renders at full backbuffer resolution (keep PostFilterLOD >=1 in the "
           "game ini)", done);
+}
+
+/* Force the working mouse path (fixes dead mouse buttons under winemac).
+ *
+ * Contracts reads only the *presence* of `UseDirectInputMouse` in the ini: if
+ * the key is present it sets an input-mode flag (byte at [esi+0x6b]) to 1, and
+ * that state is the one where mouse buttons/firing work under winemac (winemac
+ * delivers DirectInput mouse motion but not button state, so the game's default
+ * — key absent, flag 0 — leaves buttons dead). The config read is
+ * `test al,al; je +4; mov byte [esi+0x6b], 1` at RVA 0x1db8b; NOPing the `je`
+ * (74 04 -> 90 90) makes the flag always set, i.e. behaves exactly as if
+ * `UseDirectInputMouse` were in the ini — so the mouse works with no game-ini
+ * edit. We run this before the game reads its config (our DllMain runs while
+ * d3d8.dll is mapped at process init). Auto (-1) applies it under Wine only; on
+ * real Windows the DirectInput path works, so it is left alone. */
+#define WINMOUSE_RVA 0x1db8b
+
+static void patch_force_winmouse(void)
+{
+    if (!(g_force_winmouse == 1 ||
+          (g_force_winmouse == -1 && is_wine())))
+        return;
+    uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+    if (!base) return;
+    uint8_t *site = base + WINMOUSE_RVA;
+    if (site[0] != 0x74 || site[1] != 0x04) {
+        logf_("ForceWinMouse: site +0x%x is %02x %02x, not je +4 — not patching "
+              "(build mismatch)", WINMOUSE_RVA, site[0], site[1]);
+        return;
+    }
+    DWORD old;
+    if (VirtualProtect(site, 2, PAGE_EXECUTE_READWRITE, &old)) {
+        site[0] = 0x90; site[1] = 0x90;
+        VirtualProtect(site, 2, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), site, 2);
+        logf_("ForceWinMouse: mouse forced onto the Windows input path at +0x%x "
+              "— clicks/firing work without a HitmanContracts.ini edit",
+              WINMOUSE_RVA);
+    }
 }
 
 static DWORD WINAPI snap_watch(LPVOID arg)
@@ -1284,6 +1327,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             g_snap_done = 1;
         if (g_enabled)
             patch_postfilter_fullres();
+        if (g_enabled)
+            patch_force_winmouse();
         if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
         logf_("HMC Widescreen loaded%s, Fullscreen=%d Borderless=%d "

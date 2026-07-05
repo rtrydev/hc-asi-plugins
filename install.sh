@@ -40,7 +40,7 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # Widescreen + startup fix plugin
 cp "$HERE/dist/HMCWidescreen.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/HMCWidescreen.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nForceWinMouse=-1\n' \
         > "$GAME/scripts/HMCWidescreen.ini"
 fi
 
@@ -105,21 +105,12 @@ if [ -f "$INI" ]; then
         echo "HitmanContracts.ini: added Resolution ${RES} (backup: HitmanContracts.ini.bak)"
     fi
 
-    # Mouse fix (REQUIRED under CrossOver/winemac): the game defaults to reading
-    # the mouse through DirectInput, and winemac delivers DirectInput mouse
-    # motion but NOT button state — so cursor movement/look works but clicks and
-    # firing do nothing, on every device. Switching to the Windows mouse path
-    # (UseDirectInputMouse 0) restores buttons. Set it if absent or 1.
-    if grep -qiE '^[[:space:]]*UseDirectInputMouse[[:space:]]+0' "$INI"; then
-        echo "HitmanContracts.ini: UseDirectInputMouse already 0"
-    elif grep -qiE '^[[:space:]]*UseDirectInputMouse' "$INI"; then
-        sed "s/^[[:space:]]*[Uu]seDirectInputMouse[[:space:]].*/UseDirectInputMouse 0/" "$INI" > "$INI.tmp" \
-            && mv "$INI.tmp" "$INI"
-        echo "HitmanContracts.ini: UseDirectInputMouse -> 0 (mouse buttons fix)"
-    else
-        printf 'UseDirectInputMouse 0\n' >> "$INI"
-        echo "HitmanContracts.ini: added UseDirectInputMouse 0 (mouse buttons fix)"
-    fi
+    # Mouse buttons: the game defaults to DirectInput mouse, and winemac delivers
+    # DirectInput mouse motion but NOT button state — so clicks/firing do nothing.
+    # The widescreen plugin's ForceWinMouse (default: auto under Wine) patches the
+    # game at runtime to take the working Windows mouse path, so NO game-ini edit
+    # is needed. (If a future game build changes and the patch can't apply, the
+    # plugin logs it; the manual fallback is to add `UseDirectInputMouse 0` here.)
 
     # The full-res post-filter patch (PostFilterFullRes=1) needs the game's own
     # post-filter enabled, i.e. PostFilterLOD >= 1 (the stock default is 1). If a

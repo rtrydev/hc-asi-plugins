@@ -195,16 +195,23 @@ PostFilterFullRes=1 ; render the post-filter (bloom/neon flares + color grade)
                     ; at full backbuffer resolution instead of the game's
                     ; hardwired quarter-res buffer (needs PostFilterLOD >= 1 in
                     ; HitmanContracts.ini). See "Full-res post-filter" below.
+ForceWinMouse=-1    ; fix dead mouse buttons under winemac: -1 auto (on under
+                    ; Wine, off on real Windows), 0 off, 1 always. See below.
 ```
 
-### Mouse buttons — `UseDirectInputMouse 0` (required on CrossOver)
+### Mouse buttons — `ForceWinMouse` (automatic on CrossOver)
 
 Contracts defaults to reading the mouse through **DirectInput**, and winemac
 delivers DirectInput mouse *motion* but not *button* state — so the cursor
 moves and menu items highlight on hover, but **clicks and firing do nothing**,
-on every device. The fix is a game-ini setting, `UseDirectInputMouse 0` (the
-Windows mouse path, which does report buttons). `install.sh` sets this
-automatically; if you edit the ini by hand, keep it at `0`.
+on every device. The game switches to a working (Windows) mouse path purely
+based on whether `UseDirectInputMouse` is *present* in `HitmanContracts.ini`
+(the value is ignored). Rather than require that edit, the widescreen plugin
+patches the one instruction that reads it so the working path is always taken —
+so **the mouse just works, with no game-ini change**. `ForceWinMouse=-1` (the
+default) applies this under Wine only; on real Windows the DirectInput path
+already reports buttons, so it is left alone. The patch runs before the game
+reads its config and byte-checks the site, no-opping on an unrecognised build.
 
 ### Frame pacing — the limiter fix
 
