@@ -15,10 +15,11 @@
  * time that used to sit in emulated x87 inside the exe shows up under X87
  * (native SSE2) once translated, moving out of GAME.
  *
- * Drawing uses the same technique as the h2-stats-overlay reference: a
- * built-in 5x7 pixel font rendered as pre-transformed (XYZRHW) colored
- * triangles via DrawPrimitiveUP, wrapped in a full state-block save/restore
- * so the game's own rendering is untouched. It attaches through the HMC
+ * Drawing renders a built-in 5x7 pixel font as pre-transformed (XYZRHW)
+ * colored triangles via DrawPrimitiveUP. The exact device state it touches is
+ * saved and restored with explicit Get/Set calls (NOT a state block, which
+ * does not reliably restore texture-stage state on the CrossOver D3D->Metal
+ * stack) so the game's own rendering is untouched. It attaches through the HMC
  * d3d8 loader's on_frame hook (drawn just before Present), so it needs no
  * game byte offsets and coexists with the widescreen plugin.
  */
@@ -440,16 +441,23 @@ static Vtx    g_vtx[MAX_VTX];
 static int    g_nvtx;
 
 #define VT(dev, idx, T) ((T)(*(void ***)(dev))[idx])
-typedef HRESULT (STDMETHODCALLTYPE *CreateSB_t)(IDirect3DDevice8*, D3DSTATEBLOCKTYPE, DWORD*);
-typedef HRESULT (STDMETHODCALLTYPE *ApplySB_t)(IDirect3DDevice8*, DWORD);
-typedef HRESULT (STDMETHODCALLTYPE *DeleteSB_t)(IDirect3DDevice8*, DWORD);
 typedef HRESULT (STDMETHODCALLTYPE *SetRS_t)(IDirect3DDevice8*, D3DRENDERSTATETYPE, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetRS_t)(IDirect3DDevice8*, D3DRENDERSTATETYPE, DWORD*);
 typedef HRESULT (STDMETHODCALLTYPE *SetTex_t)(IDirect3DDevice8*, DWORD, IDirect3DBaseTexture8*);
+typedef HRESULT (STDMETHODCALLTYPE *GetTex_t)(IDirect3DDevice8*, DWORD, IDirect3DBaseTexture8**);
 typedef HRESULT (STDMETHODCALLTYPE *SetTSS_t)(IDirect3DDevice8*, DWORD, D3DTEXTURESTAGESTATETYPE, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetTSS_t)(IDirect3DDevice8*, DWORD, D3DTEXTURESTAGESTATETYPE, DWORD*);
 typedef HRESULT (STDMETHODCALLTYPE *SetVS_t)(IDirect3DDevice8*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetVS_t)(IDirect3DDevice8*, DWORD*);
 typedef HRESULT (STDMETHODCALLTYPE *SetPS_t)(IDirect3DDevice8*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetPS_t)(IDirect3DDevice8*, DWORD*);
+typedef HRESULT (STDMETHODCALLTYPE *SetSS_t)(IDirect3DDevice8*, UINT, IDirect3DVertexBuffer8*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *GetSS_t)(IDirect3DDevice8*, UINT, IDirect3DVertexBuffer8**, UINT*);
+typedef HRESULT (STDMETHODCALLTYPE *SetIdx_t)(IDirect3DDevice8*, IDirect3DIndexBuffer8*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *GetIdx_t)(IDirect3DDevice8*, IDirect3DIndexBuffer8**, UINT*);
 typedef HRESULT (STDMETHODCALLTYPE *GetVP_t)(IDirect3DDevice8*, D3DVIEWPORT8*);
 typedef HRESULT (STDMETHODCALLTYPE *DrawUP_t)(IDirect3DDevice8*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+typedef ULONG   (STDMETHODCALLTYPE *Rel_t)(void*);
 
 static void add_rect(float x, float y, float w, float h, DWORD c)
 {
@@ -531,12 +539,43 @@ static void draw(IDirect3DDevice8 *dev)
 
     if (!g_nvtx) return;
 
-    /* save all device state, set 2D untextured alpha-blended draw, restore */
-    DWORD sb = 0;
-    CreateSB_t createSB = VT(dev, 57, CreateSB_t);
-    if (!createSB || FAILED(createSB(dev, D3DSBT_ALL, &sb))) sb = 0;
+    /* Save exactly the device state we are about to change and restore it
+     * explicitly afterwards. We deliberately do NOT rely on a D3DSBT_ALL
+     * state block here: on the CrossOver D3D->Metal stack a state block does
+     * not reliably capture/restore texture-stage state, and the previous
+     * code's fallback (when CreateStateBlock failed) restored nothing at all.
+     * Either way the overlay's COLOROP=SELECTARG1 / COLORARG1=DIFFUSE (stage 0
+     * emits the flat vertex colour, ignoring the bound texture) plus
+     * SetTexture(0,NULL) leaked into the game, so every surface relying on the
+     * persistent COLOROP=MODULATE rendered as a single flat colour (textures
+     * "disappearing"). Explicit get/set is stack-independent and always puts
+     * the state back. */
+    static const D3DRENDERSTATETYPE RS[] = {
+        D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_CULLMODE,
+        D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_FOGENABLE,
+    };
+    static const D3DTEXTURESTAGESTATETYPE TSS[] = {
+        D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1,
+    };
+    SetRS_t  setRS  = VT(dev, 50, SetRS_t);
+    GetRS_t  getRS  = VT(dev, 51, GetRS_t);
+    SetTSS_t setTSS = VT(dev, 63, SetTSS_t);
+    GetTSS_t getTSS = VT(dev, 62, GetTSS_t);
 
-    SetRS_t setRS = VT(dev, 50, SetRS_t);
+    DWORD rs_save[8], tss_save[4], vs_save = 0, ps_save = 0;
+    UINT  stride = 0, basevi = 0;
+    IDirect3DBaseTexture8  *tex_save = NULL;
+    IDirect3DVertexBuffer8 *vb_save  = NULL;
+    IDirect3DIndexBuffer8  *ib_save  = NULL;
+    for (int i = 0; i < 8; i++) getRS(dev, RS[i], &rs_save[i]);
+    for (int i = 0; i < 4; i++) getTSS(dev, 0, TSS[i], &tss_save[i]);
+    VT(dev, 60, GetTex_t)(dev, 0, &tex_save);          /* AddRef'd */
+    VT(dev, 77, GetVS_t)(dev, &vs_save);
+    VT(dev, 89, GetPS_t)(dev, &ps_save);
+    VT(dev, 84, GetSS_t)(dev, 0, &vb_save, &stride);   /* AddRef'd */
+    VT(dev, 86, GetIdx_t)(dev, &ib_save, &basevi);     /* AddRef'd */
+
+    /* 2D untextured alpha-blended draw */
     setRS(dev, D3DRS_LIGHTING, FALSE);
     setRS(dev, D3DRS_ZENABLE, D3DZB_FALSE);
     setRS(dev, D3DRS_ZWRITEENABLE, FALSE);
@@ -546,7 +585,6 @@ static void draw(IDirect3DDevice8 *dev)
     setRS(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     setRS(dev, D3DRS_FOGENABLE, FALSE);
     VT(dev, 61, SetTex_t)(dev, 0, NULL);
-    SetTSS_t setTSS = VT(dev, 63, SetTSS_t);
     setTSS(dev, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
     setTSS(dev, 0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
     setTSS(dev, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
@@ -556,10 +594,19 @@ static void draw(IDirect3DDevice8 *dev)
 
     VT(dev, 72, DrawUP_t)(dev, D3DPT_TRIANGLELIST, g_nvtx / 3, g_vtx, sizeof(Vtx));
 
-    if (sb) {
-        VT(dev, 54, ApplySB_t)(dev, sb);
-        VT(dev, 56, DeleteSB_t)(dev, sb);
-    }
+    /* Restore everything we changed, plus what DrawPrimitiveUP itself resets
+     * (stream-0 source and the index buffer). Release the references Get*
+     * handed back. */
+    for (int i = 0; i < 8; i++) setRS(dev, RS[i], rs_save[i]);
+    for (int i = 0; i < 4; i++) setTSS(dev, 0, TSS[i], tss_save[i]);
+    VT(dev, 61, SetTex_t)(dev, 0, tex_save);
+    VT(dev, 76, SetVS_t)(dev, vs_save);
+    VT(dev, 88, SetPS_t)(dev, ps_save);
+    VT(dev, 83, SetSS_t)(dev, 0, vb_save, stride);
+    VT(dev, 85, SetIdx_t)(dev, ib_save, basevi);
+    if (tex_save) VT(tex_save, 2, Rel_t)(tex_save);
+    if (vb_save)  VT(vb_save,  2, Rel_t)(vb_save);
+    if (ib_save)  VT(ib_save,  2, Rel_t)(ib_save);
 }
 
 /* ------------------------------------------------------------------ */

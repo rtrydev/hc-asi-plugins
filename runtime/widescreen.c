@@ -1400,7 +1400,19 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
      * actual desktop format (queried once) so both stacks create. */
     read_caps_once();
     pp->Windowed = TRUE;
-    pp->BackBufferFormat = g_desktop_fmt;
+    /* Keep the game's requested backbuffer format when it is already concrete.
+     * Contracts asks for A8R8G8B8 — a backbuffer WITH a destination-alpha
+     * channel — and some scenes use destination alpha for ground/terrain
+     * detail-texture blending. Forcing the desktop's X8R8G8B8 (no alpha)
+     * stripped that channel, so exactly those surfaces blended to a flat
+     * colour or dropped out entirely (seeing "underground") on the maps that
+     * use the technique, while alpha-free maps and the 2D HUD looked fine.
+     * Only substitute the desktop format when the request is UNKNOWN: native
+     * D3D8 rejects an UNKNOWN windowed backbuffer (wined3d tolerates it),
+     * whereas a windowed device happily takes a concrete format that differs
+     * from the desktop (D3D converts on present). */
+    if (pp->BackBufferFormat == D3DFMT_UNKNOWN)
+        pp->BackBufferFormat = g_desktop_fmt;
     pp->FullScreen_RefreshRateInHz = 0;
     /* Present interval for the windowed/borderless device. On this Mac stack
      * the display is often a ProMotion 120Hz panel and the windowed present
