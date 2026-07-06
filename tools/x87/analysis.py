@@ -132,13 +132,18 @@ def required_depth(mnem, ins):
 
 
 class Analyzer:
-    def __init__(self, mod, ftol_vas=(), ci_funcs=None, callee_ret=None):
+    def __init__(self, mod, ftol_vas=(), ci_funcs=None, callee_ret=None,
+                 extra_starts=()):
         self.mod = mod
         self.ftol_vas = set(ftol_vas)
         self.ci_funcs = ci_funcs or {}   # va -> ('sin'|'cos'|..., nargs, nret)
         # va -> 0 (returns with empty x87 stack) | 1 (returns value in st0);
         # absent = unknown. Built interprocedurally from a previous pass.
         self.callee_ret = callee_ret or {}
+        # Manually-seeded entry VAs (not RVAs). Needed for functions the three
+        # automatic nets miss: on a reloc-stripped image, vtable-only virtual
+        # methods with a non-standard prologue are invisible to discover().
+        self.extra_starts = {v for v in extra_starts if mod.in_text(v)}
         self.starts = self.discover()
 
     # ---------------- discovery ----------------
@@ -177,6 +182,7 @@ class Analyzer:
                 v = struct.unpack("<I", raw)[0]
                 if mod.in_text(v):
                     starts.add(v)
+        starts |= self.extra_starts
         return sorted(starts)
 
     # ---------------- per-function analysis ----------------
@@ -553,8 +559,9 @@ class _RetryWalk(Exception):
     pass
 
 
-def analyze_module(mod, ftol_vas=(), ci_funcs=None, callee_ret=None):
-    an = Analyzer(mod, ftol_vas, ci_funcs, callee_ret)
+def analyze_module(mod, ftol_vas=(), ci_funcs=None, callee_ret=None,
+                   extra_starts=()):
+    an = Analyzer(mod, ftol_vas, ci_funcs, callee_ret, extra_starts)
     funcs = []
     starts = [s for s in an.starts if mod.in_text(s)]
     an.starts = starts
@@ -577,13 +584,14 @@ def ret_depth_map(funcs):
     return out
 
 
-def analyze_full(mod, ftol_vas, ci_funcs, iterations=3):
+def analyze_full(mod, ftol_vas, ci_funcs, iterations=3, extra_starts=()):
     """Iterate analysis so interprocedural st0-return knowledge reaches a
     fixpoint: each pass unlocks functions whose ret depth informs the next."""
     callee_ret = {}
     an = funcs = None
     for _ in range(iterations):
-        an, funcs = analyze_module(mod, ftol_vas, ci_funcs, callee_ret)
+        an, funcs = analyze_module(mod, ftol_vas, ci_funcs, callee_ret,
+                                   extra_starts)
         new_map = ret_depth_map(funcs)
         if new_map == callee_ret:
             break

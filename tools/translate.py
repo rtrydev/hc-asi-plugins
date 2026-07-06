@@ -70,15 +70,40 @@ def main():
     ap.add_argument("--include", default="",
                     help="comma-separated function RVAs (hex) to translate "
                          "even if an exclusion list names them")
+    ap.add_argument("--include-start", default="",
+                    help="comma-separated function-entry RVAs (hex) to seed "
+                         "into discovery (for vtable-only virtuals the "
+                         "automatic nets miss on a reloc-stripped image)")
     args = ap.parse_args()
 
     path = os.path.join(args.game, args.module)
     mod = Module(path)
     print(f"analyzing {args.module} ...")
-    _, funcs0 = analysis.analyze_module(mod)
+
+    # Seed entries that discovery can't reach on its own. On a reloc-stripped
+    # image (HitmanContracts.exe) the vtable/function-pointer net is dead, so
+    # virtual methods with a non-standard prologue are never offered to the
+    # translator — e.g. the rain particle builder at 0x1d9a90. Sourced from the
+    # CLI plus an optional starts/<module>.txt companion to exclusions/.
+    start_rvas = {int(x, 16) for x in args.include_start.split(",") if x}
+    starts_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "starts",
+                               os.path.basename(path).lower() + ".txt")
+    if os.path.exists(starts_file):
+        with open(starts_file) as fh:
+            for line in fh:
+                line = line.split("#")[0].strip()
+                if line:
+                    start_rvas.add(int(line, 16))
+        print(f"loaded {starts_file}")
+    extra_starts = {mod.base + r for r in start_rvas}
+    if start_rvas:
+        print(f"seeded starts: {sorted(hex(r) for r in start_rvas)}")
+
+    _, funcs0 = analysis.analyze_module(mod, extra_starts=extra_starts)
     ftol = set(find_ftol(mod, funcs0))
     ci = find_ci(mod, funcs0)
-    an, funcs = analysis.analyze_full(mod, ftol, ci)
+    an, funcs = analysis.analyze_full(mod, ftol, ci, extra_starts=extra_starts)
 
     # never hook the CRT helpers themselves (their callers are rewritten)
     helper_vas = ftol | set(ci)

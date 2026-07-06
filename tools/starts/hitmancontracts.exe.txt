@@ -1,0 +1,14 @@
+# Manually-seeded function entry RVAs for the x87 translator.
+#
+# HitmanContracts.exe ships with its base-relocation table stripped, which
+# kills discover()'s vtable/function-pointer net (analysis.py). Virtual
+# methods that are only reachable through a vtable slot AND lack the
+# `push ebp; mov ebp, esp` prologue are therefore never handed to the
+# translator, so their x87 runs emulated (80-bit software) under CrossOver.
+#
+# 0x1d9a90 — the rain particle vertex builder (RenderD3D). A thiscall virtual
+#   (`sub esp,0x1c0; mov ebp,ecx`) referenced only from .rdata:0x32ae94. 433
+#   x87 insns, max stack depth 5; analyzes "ok" and translates to a ~7.5 KB
+#   SSE2 blob. This is the sole cause of the rain frame-time hit (~9-11 ms of
+#   un-instrumented game CPU per frame; GPU/Present is idle in rain).
+0x1d9a90
