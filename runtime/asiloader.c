@@ -88,6 +88,7 @@ static int g_rt_logs;               /* render-target creation log counter */
  * Ordinary alpha-blended geometry/HUD textures are not render-target textures,
  * so they do not match this gate. */
 static int g_postfx_alpha_fix;
+static int g_postfx_opaque_rt;
 static IDirect3DSurface8 *g_backbuffer;
 static int g_rt_is_backbuffer = 1;
 static int g_stage0_is_rttex;
@@ -97,6 +98,12 @@ static int g_alpha_blend;
 static DWORD g_srcblend = D3DBLEND_ONE;
 static unsigned int g_postfx_alpha_hits;
 static unsigned int g_postfx_probe_logs;
+
+static int is_postfilter_rt_caller(uint32_t rva)
+{
+    return rva == 0x1de1a0 || rva == 0x1de1c8 || rva == 0x1de1f0 ||
+           rva == 0x1de218 || rva == 0x1de23f || rva == 0x1de263;
+}
 
 #define MAX_RT_TEX 64
 typedef struct { IDirect3DBaseTexture8 *tex; UINT w, h; D3DFORMAT fmt; } RTTex;
@@ -325,12 +332,22 @@ static HRESULT WINAPI hook_CreateTexture(IDirect3DDevice8 *self, UINT W, UINT H,
 {
     typedef HRESULT (WINAPI *ct_t)(IDirect3DDevice8 *, UINT, UINT, UINT, DWORD,
         D3DFORMAT, D3DPOOL, IDirect3DTexture8 **);
+    uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+    void *ret = __builtin_return_address(0);
+    uint32_t rva = base ? (uint32_t)((uint8_t *)ret - base) : 0;
+    D3DFORMAT requested_fmt = Fmt;
+    if (g_postfx_opaque_rt && (Usage & D3DUSAGE_RENDERTARGET) &&
+        Fmt == D3DFMT_A8R8G8B8 && is_postfilter_rt_caller(rva)) {
+        Fmt = D3DFMT_X8R8G8B8;
+        if (g_rt_logs < 40)
+            logf_("PostFilterOpaqueRT: CreateTexture RT exe+0x%x %ux%u "
+                  "fmt %d -> %d", rva, W, H, requested_fmt, Fmt);
+    }
     if ((Usage & D3DUSAGE_RENDERTARGET) && g_rt_logs < 40) {
         g_rt_logs++;
         logf_("CreateTexture RT %ux%u fmt=%d usage=0x%lx caller=%p (exe+0x%tx)",
-              W, H, Fmt, (unsigned long)Usage, __builtin_return_address(0),
-              (uint8_t *)__builtin_return_address(0) -
-              (uint8_t *)GetModuleHandleA(NULL));
+              W, H, Fmt, (unsigned long)Usage, ret,
+              base ? (uint8_t *)ret - base : 0);
     }
     HRESULT hr = ((ct_t)g_orig_createtexture)(self, W, H, Levels, Usage, Fmt,
                                               Pool, pp);
@@ -1224,6 +1241,15 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
                   pfx_ini ? "HMCWidescreen.ini" :
                   (pfx_file ? "scripts/POSTFX_ALPHA_FIX marker" :
                    "HMC_POSTFX_ALPHA_FIX=1"));
+        }
+        memset(v, 0, sizeof(v));
+        int pfox_env = GetEnvironmentVariableA("HMC_POSTFX_OPAQUE_RT", v,
+                                               sizeof(v)) && v[0] == '1';
+        int pfox_ini = read_int_ini("PostFilterOpaqueRT", 0);
+        if (pfox_env || pfox_ini) {
+            g_postfx_opaque_rt = 1;
+            logf_("PostFilterOpaqueRT ENABLED (%s)",
+                  pfox_ini ? "HMCWidescreen.ini" : "HMC_POSTFX_OPAQUE_RT=1");
         }
         memset(v, 0, sizeof(v));
         int rain_env = GetEnvironmentVariableA("HMC_RAIN_EMIT_CAP", v,

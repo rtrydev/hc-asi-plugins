@@ -199,6 +199,9 @@ PostFilterAlphaFix=0 ; experimental D3DMetal workaround for the post-filter
                     ; vanishing with the A8 backbuffer: render-target texture
                     ; composites to the backbuffer use SRCBLEND=ONE instead of
                     ; SRCALPHA. Off by default until visually verified.
+PostFilterOpaqueRT=0 ; experimental D3DMetal workaround: keep the main A8
+                    ; backbuffer for detail textures, but create only the
+                    ; post-filter render targets as X8R8G8B8.
 RainEmitCap=0      ; experimental rain CPU limiter. 0 = off; values such as
                     ; 256/384/512 clamp the worst-case per-pass rain emission
                     ; burst before the expensive particle vertex builder.
@@ -311,6 +314,11 @@ back to the backbuffer with `SRCALPHA` are drawn with `SRCBLEND=ONE`, then the
 game's logical state is restored. It can also be enabled for quick testing with
 `HMC_POSTFX_ALPHA_FIX=1` or a `scripts/POSTFX_ALPHA_FIX` marker file. Check
 `scripts/HMCAsiLoader.log` for `PostFilterAlphaFix` hit lines.
+
+`PostFilterOpaqueRT=1` targets the related A8-backbuffer regression more
+directly: the scene backbuffer remains A8R8G8B8 for destination-alpha texture
+effects, but the known post-filter render targets are created as X8R8G8B8 so
+the bloom/color-grade chain behaves like it did before the A8 backbuffer fix.
 
 ### Rain emission cap (`RainEmitCap`)
 
