@@ -40,7 +40,7 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # Widescreen + startup fix plugin
 cp "$HERE/dist/HMCWidescreen.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/HMCWidescreen.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nForceWinMouse=-1\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n' \
         > "$GAME/scripts/HMCWidescreen.ini"
 fi
 
@@ -105,12 +105,17 @@ if [ -f "$INI" ]; then
         echo "HitmanContracts.ini: added Resolution ${RES} (backup: HitmanContracts.ini.bak)"
     fi
 
-    # Mouse buttons: the game defaults to DirectInput mouse, and winemac delivers
-    # DirectInput mouse motion but NOT button state — so clicks/firing do nothing.
-    # The widescreen plugin's ForceWinMouse (default: auto under Wine) patches the
-    # game at runtime to take the working Windows mouse path, so NO game-ini edit
-    # is needed. (If a future game build changes and the patch can't apply, the
-    # plugin logs it; the manual fallback is to add `UseDirectInputMouse 0` here.)
+    # Mouse: winemac makes the stock DirectInput mouse misbehave in two ways, both
+    # fixed at runtime by the widescreen plugin (all auto under Wine, no ini edit):
+    #   - ForceWinMouse  : buttons/firing (DirectInput carries motion but not
+    #                      button state on this stack) — kept on the DirectInput
+    #                      path so clicks work;
+    #   - MouseClipFix   : the mouse-look "edge wall" (a full-desktop cursor clip
+    #                      leaves winemac in absolute mode) — inset so it goes
+    #                      relative;
+    #   - MouseMotionFix : slow-move camera stall (DirectInput's relative axis
+    #                      loses sub-pixel motion under winemac) — camera motion is
+    #                      fed from the OS cursor while buttons stay on DirectInput.
 
     # The full-res post-filter patch (PostFilterFullRes=1) needs the game's own
     # post-filter enabled, i.e. PostFilterLOD >= 1 (the stock default is 1). If a

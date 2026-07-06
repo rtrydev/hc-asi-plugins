@@ -197,6 +197,12 @@ PostFilterFullRes=1 ; render the post-filter (bloom/neon flares + color grade)
                     ; HitmanContracts.ini). See "Full-res post-filter" below.
 ForceWinMouse=-1    ; fix dead mouse buttons under winemac: -1 auto (on under
                     ; Wine, off on real Windows), 0 off, 1 always. See below.
+MouseClipFix=-1     ; fix the mouse-look "edge wall" under winemac by insetting
+                    ; the engine's cursor clip so winemac uses relative motion:
+                    ; -1 auto (on under Wine, off on real Windows), 0 off, 1 on.
+MouseMotionFix=-1   ; fix the slow-move camera stall by feeding camera motion from
+                    ; the OS cursor (buttons stay on DirectInput): -1 auto (on
+                    ; under Wine, off on real Windows), 0 off, 1 on.
 ```
 
 ### Mouse buttons — `ForceWinMouse` (automatic on CrossOver)
@@ -212,6 +218,53 @@ so **the mouse just works, with no game-ini change**. `ForceWinMouse=-1` (the
 default) applies this under Wine only; on real Windows the DirectInput path
 already reports buttons, so it is left alone. The patch runs before the game
 reads its config and byte-checks the site, no-opping on an unrecognised build.
+
+### Mouse-look "edge wall" — `MouseClipFix` (automatic on CrossOver)
+
+Turning the camera, the view would stop dead against an invisible line — usually
+toward the **right or down** — letting the mouse only travel back or slide along
+the other axis until you shoved hard past the edge. The same bug is in Hitman 2:
+it is the Glacier engine's, not this build's.
+
+For mouse-look the engine captures the pointer by **clipping the OS cursor to its
+full window**, then each frame reads the cursor position, turns the camera by the
+delta from the window centre, and recentres with `SetCursorPos`. winemac only
+switches the Mac pointer into **relative motion** — where warps are honoured and
+movement arrives as unbounded deltas — when the clip rectangle is a *strict
+subset* of the display; a clip covering the **whole** desktop is treated as "not
+clipping", leaving the pointer in **absolute** mode where the reported position
+is clamped to the screen edges. Because the borderless window is sized exactly to
+the desktop, the engine's full-window clip equals the whole display, so winemac
+stays in absolute mode: push right/down and the position pins at the edge, the
+per-frame delta collapses to zero, and the recentre can't rescue it — the wall.
+
+The plugin hooks `ClipCursor` and, whenever the game clips to (essentially) the
+whole display, insets the rectangle by 2 px so it is a strict subset. winemac
+then engages relative mode and the recentre/deltas behave — the wall is gone,
+with the confined area imperceptibly 2 px smaller. A cursor *release* (menus,
+where the pointer roams freely) is passed through untouched. `MouseClipFix=-1`
+(the default) applies this under Wine only; real Windows is left alone.
+
+### Slow-move camera stall — `MouseMotionFix` (automatic on CrossOver)
+
+With the edge wall gone, one more artefact remained: turning the camera **slowly**
+stalled (worst horizontally), and after a big sweep an invisible boundary came
+back — but the same slow motion moved the *cursor* fine. The cause is where the
+camera's motion comes from. Contracts reads the mouse through **DirectInput**
+(that is the path whose buttons work under winemac), and DirectInput's *relative*
+axis is lossy on this stack: winemac hands it an integer per-event delta taken
+from the accelerated macOS `CGEvent` stream, so a slow move rounds to zero every
+event and the camera doesn't move. The win32 `GetCursorPos` position does **not**
+lose this — winemac accumulates the fractional motion into the absolute cursor,
+so it creeps smoothly at any speed (which is why the cursor tracked slow motion
+while the camera didn't).
+
+The plugin wraps the DirectInput mouse device (via COM vtable patch, no game
+byte-offsets) and, while camera-look is active, **replaces the device's X/Y with
+motion derived from `GetCursorPos`** — the same smooth source — recentring each
+read, while passing the **buttons through untouched**. So you get slow-move
+camera *and* working fire from the one path. Menus are left alone. `MouseMotionFix=-1`
+(the default) applies this under Wine only; real Windows keeps native DirectInput.
 
 ### Frame pacing — the limiter fix
 

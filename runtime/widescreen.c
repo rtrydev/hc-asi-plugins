@@ -54,6 +54,12 @@
  *                   ; the cap (present every Nth vblank when refresh = N*cap),
  *                   ; else vsync every frame; 0 off (software cap only, may
  *                   ; tear); 1 force vsync-every-frame
+ *   MouseClipFix=-1 ; fix the mouse-look "edge wall" under winemac by insetting
+ *                   ; the engine's full-window cursor clip so winemac switches to
+ *                   ; relative mouse motion: -1 auto (Wine), 0 off, 1 on
+ *   MouseMotionFix=-1 ; fix the slow-move camera stall by feeding camera motion
+ *                   ; from the OS cursor instead of DirectInput's lossy relative
+ *                   ; axis (buttons stay on DI): -1 auto (Wine), 0 off, 1 on
  */
 #include <d3d8.h>
 #include <stdio.h>
@@ -86,6 +92,14 @@ static float g_pf_scale = 0.5f;     /* unused; kept for ini backward-compat */
 static int g_force_winmouse = -1;   /* force the Windows mouse path (working
                                      * buttons under winemac): -1 auto (Wine),
                                      * 0 off, 1 always */
+static int g_mouseclipfix = -1;     /* inset the engine's full-window cursor clip
+                                     * so winemac uses relative mouse motion,
+                                     * fixing the mouse-look edge wall: -1 auto
+                                     * (Wine), 0 off, 1 always */
+static int g_mousemotionfix = -1;   /* feed the DirectInput camera motion from the
+                                     * OS cursor (which tracks slow movement under
+                                     * winemac) instead of DI's lossy relative
+                                     * axis: -1 auto (Wine), 0 off, 1 always */
 static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
 static D3DFORMAT g_desktop_fmt = D3DFMT_X8R8G8B8; /* desktop backbuffer format */
 static int g_caps_done;             /* caps queried yet? */
@@ -160,6 +174,12 @@ static void read_config(void)
         else if (sscanf(line, " ForceWinMouse = %d", &b) == 1 ||
                  sscanf(line, " ForceWinMouse=%d", &b) == 1)
             g_force_winmouse = b < 0 ? -1 : (b != 0);
+        else if (sscanf(line, " MouseClipFix = %d", &b) == 1 ||
+                 sscanf(line, " MouseClipFix=%d", &b) == 1)
+            g_mouseclipfix = b < 0 ? -1 : (b != 0);
+        else if (sscanf(line, " MouseMotionFix = %d", &b) == 1 ||
+                 sscanf(line, " MouseMotionFix=%d", &b) == 1)
+            g_mousemotionfix = b < 0 ? -1 : (b != 0);
     }
     fclose(f);
     if (g_backbuffers < 0 || g_backbuffers > 3) g_backbuffers = 2;
@@ -376,6 +396,16 @@ static DWORD WINAPI snap_watch(LPVOID arg)
 static int cursorfix_wanted(void)
 {
     return g_cursorfix == 1 || (g_cursorfix == -1 && is_wine());
+}
+
+static int mouseclipfix_wanted(void)
+{
+    return g_mouseclipfix == 1 || (g_mouseclipfix == -1 && is_wine());
+}
+
+static int mousemotionfix_wanted(void)
+{
+    return g_mousemotionfix == 1 || (g_mousemotionfix == -1 && is_wine());
 }
 
 /* Redirect one IAT entry (module imports dll!fn) to hook; saves the original
@@ -622,6 +652,330 @@ static void hook_game_imports(void)
     }
 }
 
+/* Fix the mouse-look "edge wall": push the OS pointer into relative motion mode.
+ *
+ * The Glacier engine captures the pointer for camera-look by clipping the OS
+ * cursor to its full client rect (GetClientRect -> ClientToScreen -> ClipCursor),
+ * then every frame reads GetCursorPos, applies the delta from the window centre
+ * to the camera, and recentres with SetCursorPos. On Windows the warp is
+ * instantaneous and raw motion is unbounded, so that just works.
+ *
+ * winemac only switches the Mac pointer to relative / associated-off mode — where
+ * CGWarpMouseCursorPosition warps are honoured and motion arrives as unbounded
+ * MOUSE_MOVED_RELATIVE deltas — when the requested clip rect is a STRICT SUBSET
+ * of the display. A clip equal to the whole desktop is treated as "not clipping",
+ * leaving the pointer in ABSOLUTE mode, where GetCursorPos is clamped to the
+ * screen edges: push right or down and the reported position pins at the far
+ * edge, the per-frame delta collapses to zero, and the recentre can't rescue it —
+ * the camera stops dead against an invisible wall until you drag the pointer back
+ * (and shoving harder past the edge is what eventually registers motion again).
+ * Because the borderless window is sized EXACTLY to the desktop, the engine's
+ * full-client clip == the whole display, so winemac never leaves absolute mode
+ * and the wall is permanent. This is the same engine behaviour behind the
+ * identical bug in Hitman 2.
+ *
+ * Fix: intercept ClipCursor and, whenever the game clips to (essentially) the
+ * whole display, inset the rect a couple of pixels so it is a strict subset of
+ * the screen. winemac then engages relative mode and warps/deltas behave — the
+ * wall is gone, with the confined area shrunk by an imperceptible 2px. A NULL
+ * (release) clip is passed straight through, so menus — where the pointer roams
+ * freely and the clip is released — are untouched. Wine-only by default; real
+ * Windows needs no change and is left alone. */
+static BOOL (WINAPI *g_real_clipcursor)(const RECT *);
+
+/* Mouse-look state, learned from the engine's own ClipCursor calls: it clips to
+ * its window while camera-look is active and releases (ClipCursor(NULL)) in
+ * menus. The DirectInput motion fix (below) only rewrites motion while look is
+ * active, so menus keep their normal free pointer. */
+static volatile LONG g_look_active;
+static volatile LONG g_look_primed;    /* reset on each look-enable to swallow the
+                                        * first frame's stale delta (no jolt) */
+
+static BOOL WINAPI my_clipcursor(const RECT *rc)
+{
+    /* Track look-active regardless of whether the clip-inset itself is wanted,
+     * so the motion fix can run even with MouseClipFix off. */
+    LONG active = rc ? 1 : 0;
+    if (active != g_look_active) {
+        g_look_active = active;
+        if (active) g_look_primed = 0;
+    }
+
+    if (!g_enabled || !mouseclipfix_wanted() || !rc)
+        return g_real_clipcursor ? g_real_clipcursor(rc) : TRUE;
+
+    /* Primary display bounds. The game window is a borderless popup at (0,0)
+     * covering the desktop, and it clips to its own client rect, so the "whole
+     * display" it can reach is 0,0 .. screen w,h. */
+    int dw = GetSystemMetrics(SM_CXSCREEN);
+    int dh = GetSystemMetrics(SM_CYSCREEN);
+    if (dw < 40 || dh < 40)
+        return g_real_clipcursor ? g_real_clipcursor(rc) : TRUE;
+
+    /* Inset every edge that reaches (or passes) the display bound, so the clip
+     * can never equal the full desktop — which winemac reads as "unclipped". */
+    const int INSET = 2;
+    RECT out = *rc;
+    if (out.left   <= 0)   out.left   = INSET;
+    if (out.top    <= 0)   out.top    = INSET;
+    if (out.right  >= dw)  out.right  = dw - INSET;
+    if (out.bottom >= dh)  out.bottom = dh - INSET;
+    if (out.right  <= out.left)  out.right  = out.left + 1;
+    if (out.bottom <= out.top)   out.bottom = out.top + 1;
+
+    static LONG logged;
+    if (!logged) {
+        logged = 1;
+        logf_("ClipCursor inset for relative mouse: (%ld,%ld,%ld,%ld) -> "
+              "(%ld,%ld,%ld,%ld) on %dx%d — winemac now delivers relative "
+              "motion, fixing the mouse-look edge wall",
+              rc->left, rc->top, rc->right, rc->bottom,
+              out.left, out.top, out.right, out.bottom, dw, dh);
+    }
+    return g_real_clipcursor ? g_real_clipcursor(&out) : TRUE;
+}
+
+/* Install the ClipCursor IAT hook on the main exe. Independent of CursorFix:
+ * the edge-wall fix is wanted even with the host-cursor hider off. The exe's
+ * import table is bound before our DllMain runs, so this resolves immediately;
+ * cursor_watch also retries it as a backstop. */
+static void hook_clipcursor(void)
+{
+    static int done;
+    if (done || !g_enabled ||
+        !(mouseclipfix_wanted() || mousemotionfix_wanted())) return;
+    HMODULE exe = GetModuleHandleA(NULL);
+    if (exe && iat_hook(exe, "user32.dll", "ClipCursor",
+                        (void *)my_clipcursor, (void **)&g_real_clipcursor)) {
+        done = 1;
+        logf_("ClipCursor hooked — full-window cursor clips are inset so winemac "
+              "uses relative mouse motion (fixes the mouse-look edge wall), and "
+              "camera-look state is tracked for the motion fix");
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * DirectInput camera-motion fix.
+ *
+ * Contracts reads the mouse through DirectInput (UseDirectInputMouse; forced on
+ * under Wine by ForceWinMouse) because that is the path whose BUTTONS work under
+ * winemac — the win32 message path leaves clicks/firing dead. But DirectInput's
+ * RELATIVE axis is lossy on this stack: winemac hands DI an integer per-event
+ * delta taken from the accelerated CGEvent stream, and a SLOW mouse move rounds
+ * to zero every event, so the camera stalls until you move fast enough to cross
+ * a whole pixel in one event. The win32 GetCursorPos position does NOT lose this
+ * — winemac accumulates the fractional motion into the absolute cursor, so the
+ * cursor (and the win32-motion camera) creeps smoothly at any speed. That is why
+ * with ForceWinMouse=0 the camera moved perfectly but the buttons died.
+ *
+ * This fix keeps the DirectInput device (so buttons keep working) but REPLACES
+ * the device's X/Y axis data with motion derived from GetCursorPos — the same
+ * smooth source the win32 path uses — while camera-look is active. Each read we
+ * sample the cursor's delta from the window centre and recentre the cursor.
+ * Contracts reads the mouse in IMMEDIATE mode (GetDeviceState into a DIMOUSESTATE):
+ * we overwrite its lX/lY and leave the buttons/wheel untouched. The buffered
+ * path (GetDeviceData) is also handled for robustness — there we drop the real
+ * relative X/Y events and inject synthetic ones — but Contracts does not use it.
+ * Menus (look inactive) are left entirely alone. Wine-only by default.
+ *
+ * It is installed by patching COM vtable slots (IDirectInput8::CreateDevice to
+ * catch the SysMouse device, then that device's GetDeviceState + GetDeviceData),
+ * so there is no game byte-offset dependency. */
+
+/* Minimal DirectInput ABI (avoid pulling dinput.h). */
+typedef struct { DWORD dwOfs; DWORD dwData; DWORD dwTimeStamp; DWORD dwSequence;
+                 ULONG_PTR uAppData; } HMC_DIOBJDATA;
+#ifndef DIGDD_PEEK
+#define DIGDD_PEEK 0x00000001
+#endif
+#define HMC_DIMOFS_X 0
+#define HMC_DIMOFS_Y 4
+/* GUID_SysMouse = {6F1D2B60-D5A0-11CF-BFC7-444553540000} */
+static const GUID HMC_GUID_SysMouse =
+    { 0x6F1D2B60, 0xD5A0, 0x11CF, { 0xBF,0xC7,0x44,0x45,0x53,0x54,0x00,0x00 } };
+
+typedef HRESULT (WINAPI *hmc_di8create_t)(HINSTANCE, DWORD, REFIID, void **, void *);
+typedef HRESULT (WINAPI *hmc_createdevice_t)(void *, REFGUID, void **, void *);
+typedef HRESULT (WINAPI *hmc_getdevicedata_t)(void *, DWORD, void *, DWORD *, DWORD);
+
+typedef HRESULT (WINAPI *hmc_getdevicestate_t)(void *, DWORD, void *);
+
+static hmc_di8create_t     g_real_di8create;
+static hmc_createdevice_t  g_real_createdevice;
+static hmc_getdevicedata_t g_real_getdevicedata;
+static hmc_getdevicestate_t g_real_getdevicestate;
+static void *g_di_mouse;                       /* the SysMouse device object */
+static BOOL (WINAPI *g_setcursorpos_p)(int, int); /* real SetCursorPos, unhooked */
+
+static int client_center_screen(HWND w, POINT *out);   /* fwd decl */
+
+/* Compute this frame's camera motion from the OS cursor (smooth at any speed)
+ * and recentre. Returns 0 if the cursor/centre can't be read. */
+static int look_motion_delta(int *dx, int *dy)
+{
+    POINT c, p;
+    if (!client_center_screen(g_game_hwnd, &c) || !GetCursorPos(&p)) return 0;
+    *dx = p.x - c.x; *dy = p.y - c.y;
+    if (g_setcursorpos_p) g_setcursorpos_p(c.x, c.y);
+    if (!g_look_primed) { g_look_primed = 1; *dx = *dy = 0; }
+    return 1;
+}
+
+/* Immediate-mode read (IDirectInputDevice8::GetDeviceState) — the path Contracts
+ * actually uses for the mouse: it fills a DIMOUSESTATE(2) whose first two LONGs
+ * are the relative lX/lY. While camera-look is active we overwrite those two with
+ * our cursor-derived delta (and recentre); everything after them — the buttons
+ * and wheel — is left exactly as DirectInput filled it, so firing keeps working. */
+static HRESULT WINAPI my_getdevicestate(void *dev, DWORD cb, void *ptr)
+{
+    HRESULT hr = g_real_getdevicestate(dev, cb, ptr);
+    if (SUCCEEDED(hr) && dev == g_di_mouse && g_look_active &&
+        mousemotionfix_wanted() && ptr && cb >= 2 * sizeof(LONG)) {
+        int dx, dy;
+        if (look_motion_delta(&dx, &dy)) {
+            ((LONG *)ptr)[0] = dx;   /* lX */
+            ((LONG *)ptr)[1] = dy;   /* lY */
+        }
+    }
+    return hr;
+}
+
+/* Client-area centre of the game window, in screen coordinates — the point the
+ * engine itself recentres to, so our recentre never fights the engine's. */
+static int client_center_screen(HWND w, POINT *out)
+{
+    RECT rc;
+    if (!w || !IsWindow(w) || !GetClientRect(w, &rc)) return 0;
+    out->x = rc.right / 2;
+    out->y = rc.bottom / 2;
+    return ClientToScreen(w, out);
+}
+
+/* GetDeviceData replacement for the mouse: rewrite motion, keep buttons. */
+static HRESULT WINAPI my_getdevicedata(void *dev, DWORD cb, void *rgdod,
+                                       DWORD *pdwInOut, DWORD flags)
+{
+    DWORD cap = pdwInOut ? *pdwInOut : 0;
+    HRESULT hr = g_real_getdevicedata(dev, cb, rgdod, pdwInOut, flags);
+
+    /* Only rewrite real, consuming reads of the mouse during camera-look. PEEK
+     * reads, other devices, menus, and any anomaly pass through untouched, so we
+     * never drop the device's own motion without supplying a replacement. */
+    if (FAILED(hr) || dev != g_di_mouse || !g_look_active ||
+        !mousemotionfix_wanted() || (flags & DIGDD_PEEK) ||
+        !rgdod || !pdwInOut || cb < sizeof(DWORD) * 4)
+        return hr;
+
+    /* Cursor delta from the window centre, then recentre — the same smooth,
+     * slow-move-friendly source the win32 path uses. If we can't read it, leave
+     * the device's data alone. */
+    int dx, dy;
+    if (!look_motion_delta(&dx, &dy))
+        return hr;
+
+    BYTE *buf = (BYTE *)rgdod;
+    DWORD n = *pdwInOut;
+
+    /* Drop the device's own (lossy) X/Y relative events; keep buttons/wheel. */
+    DWORD w = 0;
+    for (DWORD r = 0; r < n; r++) {
+        DWORD ofs = *(DWORD *)(buf + (size_t)r * cb);
+        if (ofs == HMC_DIMOFS_X || ofs == HMC_DIMOFS_Y) continue;
+        if (w != r) memcpy(buf + (size_t)w * cb, buf + (size_t)r * cb, cb);
+        w++;
+    }
+
+    /* Inject our motion as fresh X/Y events (if the game's buffer has room). */
+    static DWORD seq;
+    DWORD now = GetTickCount();
+    if (dx && w < cap) {
+        BYTE *e = buf + (size_t)w * cb;
+        *(DWORD *)(e + 0) = HMC_DIMOFS_X;
+        *(DWORD *)(e + 4) = (DWORD)dx;
+        *(DWORD *)(e + 8) = now;
+        *(DWORD *)(e + 12) = ++seq;
+        w++;
+    }
+    if (dy && w < cap) {
+        BYTE *e = buf + (size_t)w * cb;
+        *(DWORD *)(e + 0) = HMC_DIMOFS_Y;
+        *(DWORD *)(e + 4) = (DWORD)dy;
+        *(DWORD *)(e + 8) = now;
+        *(DWORD *)(e + 12) = ++seq;
+        w++;
+    }
+
+    *pdwInOut = w;
+    return hr;
+}
+
+/* Patch one function pointer in a COM object's vtable. The vtable lives in
+ * dinput8.dll's read-only data, so flip protection around the write. */
+static int patch_vtable_slot(void *obj, int index, void *hook, void **orig)
+{
+    void **vtbl = *(void ***)obj;
+    DWORD old;
+    if (!VirtualProtect(&vtbl[index], sizeof(void *), PAGE_READWRITE, &old))
+        return 0;
+    if (orig) *orig = vtbl[index];
+    vtbl[index] = hook;
+    VirtualProtect(&vtbl[index], sizeof(void *), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), &vtbl[index], sizeof(void *));
+    return 1;
+}
+
+static HRESULT WINAPI my_createdevice(void *self, REFGUID rguid, void **out,
+                                      void *outer)
+{
+    HRESULT hr = g_real_createdevice(self, rguid, out, outer);
+    if (SUCCEEDED(hr) && out && *out && rguid &&
+        memcmp(rguid, &HMC_GUID_SysMouse, sizeof(GUID)) == 0) {
+        g_di_mouse = *out;                 /* remember which device is the mouse */
+        /* Hook GetDeviceState (index 9) and GetDeviceData (index 10) once. */
+        static int patched;
+        if (!patched) {
+            patched = 1;
+            int a = patch_vtable_slot(*out, 9, (void *)my_getdevicestate,
+                                      (void **)&g_real_getdevicestate);
+            int b = patch_vtable_slot(*out, 10, (void *)my_getdevicedata,
+                                      (void **)&g_real_getdevicedata);
+            logf_("DirectInput SysMouse read hooks installed (state=%d data=%d) — "
+                  "camera motion fed from the OS cursor, buttons unchanged", a, b);
+        }
+    }
+    return hr;
+}
+
+static HRESULT WINAPI my_di8create(HINSTANCE inst, DWORD ver, REFIID riid,
+                                   void **out, void *outer)
+{
+    HRESULT hr = g_real_di8create(inst, ver, riid, out, outer);
+    if (SUCCEEDED(hr) && out && *out && !g_real_createdevice) {
+        /* Hook IDirectInput8::CreateDevice (vtable index 3). */
+        if (patch_vtable_slot(*out, 3, (void *)my_createdevice,
+                              (void **)&g_real_createdevice))
+            logf_("IDirectInput8::CreateDevice hooked (for the mouse motion fix)");
+    }
+    return hr;
+}
+
+static void hook_dinput(void)
+{
+    static int done;
+    if (done || !g_enabled || !mousemotionfix_wanted()) return;
+    if (!g_setcursorpos_p) {
+        HMODULE u = GetModuleHandleA("user32.dll");
+        g_setcursorpos_p = u ? (BOOL (WINAPI *)(int, int))(uintptr_t)
+            GetProcAddress(u, "SetCursorPos") : NULL;
+    }
+    HMODULE exe = GetModuleHandleA(NULL);
+    if (exe && iat_hook(exe, "dinput8.dll", "DirectInput8Create",
+                        (void *)my_di8create, (void **)&g_real_di8create)) {
+        done = 1;
+        logf_("DirectInput8Create hooked — mouse motion fix armed");
+    }
+}
+
 /* Keep the OS pointer out of the screen's bottom/top edge strips. macOS
  * force-shows the cursor when the pointer dwells in the auto-hidden Dock /
  * menu-bar reveal zones at the screen edges — a WindowServer behaviour that
@@ -735,6 +1089,8 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
     for (int tick = 0;; tick++) {
         Sleep(20);
         hook_game_imports();
+        hook_clipcursor();     /* edge-wall fix; independent of CursorFix */
+        hook_dinput();         /* camera-motion fix; independent of CursorFix */
 
         HWND w = g_game_hwnd;
         /* Startup activation — runs regardless of CursorFix. This is NOT a
@@ -1330,12 +1686,18 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (g_enabled)
             patch_force_winmouse();
         if (g_enabled)
+            hook_clipcursor();     /* fix the mouse-look edge wall (Wine) */
+        if (g_enabled)
+            hook_dinput();         /* fix DI camera motion at slow speed (Wine) */
+        if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
         logf_("HMC Widescreen loaded%s, Fullscreen=%d Borderless=%d "
-              "FOVCorrect=%d FOVFactor=%.2f FpsCap=%d VSync=%d, HitmanContracts.ini "
-              "resolution %dx%d", g_enabled ? "" : " (disabled)",
+              "FOVCorrect=%d FOVFactor=%.2f FpsCap=%d VSync=%d MouseClipFix=%d "
+              "MouseMotionFix=%d, HitmanContracts.ini resolution %dx%d",
+              g_enabled ? "" : " (disabled)",
               g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
-              g_fpscap, g_vsync, g_ini_w, g_ini_h);
+              g_fpscap, g_vsync, g_mouseclipfix, g_mousemotionfix,
+              g_ini_w, g_ini_h);
 
         HMODULE loader = GetModuleHandleA("d3d8.dll");
         hmc_register_fn reg = loader ? (hmc_register_fn)(uintptr_t)
