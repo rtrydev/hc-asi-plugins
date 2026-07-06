@@ -195,6 +195,16 @@ PostFilterFullRes=1 ; render the post-filter (bloom/neon flares + color grade)
                     ; at full backbuffer resolution instead of the game's
                     ; hardwired quarter-res buffer (needs PostFilterLOD >= 1 in
                     ; HitmanContracts.ini). See "Full-res post-filter" below.
+PostFilterAlphaFix=0 ; experimental D3DMetal workaround for the post-filter
+                    ; vanishing with the A8 backbuffer: render-target texture
+                    ; composites to the backbuffer use SRCBLEND=ONE instead of
+                    ; SRCALPHA. Off by default until visually verified.
+RainEmitCap=0      ; experimental rain CPU limiter. 0 = off; values such as
+                    ; 256/384/512 clamp the worst-case per-pass rain emission
+                    ; burst before the expensive particle vertex builder.
+RainSystemCap=0    ; experimental frame-level rain limiter. 0 = off; values
+                    ; such as 24/32/48 limit visible rain systems processed per
+                    ; frame before the same particle builder.
 ForceWinMouse=-1    ; fix dead mouse buttons under winemac: -1 auto (on under
                     ; Wine, off on real Windows), 0 off, 1 always. See below.
 MouseClipFix=-1     ; fix the mouse-look "edge wall" under winemac by insetting
@@ -291,6 +301,29 @@ size). The ÷4 bloom buffer is left small (a downsampled bloom is correct and
 cheap). The patch verifies the exact bytes first and no-ops on a build it does
 not recognise; keep `PostFilterLOD >= 1` in `HitmanContracts.ini` so the filter
 path runs.
+
+On CrossOver's D3DMetal path, keeping the game's requested A8R8G8B8 backbuffer
+fixes terrain/detail textures but can make the post-filter composite vanish:
+the final composite blends a render-target texture with `SRCBLEND=SRCALPHA`,
+and D3DMetal leaves that render-target alpha near zero. `PostFilterAlphaFix=1`
+is an opt-in workaround in the loader: only render-target textures being blended
+back to the backbuffer with `SRCALPHA` are drawn with `SRCBLEND=ONE`, then the
+game's logical state is restored. It can also be enabled for quick testing with
+`HMC_POSTFX_ALPHA_FIX=1` or a `scripts/POSTFX_ALPHA_FIX` marker file. Check
+`scripts/HMCAsiLoader.log` for `PostFilterAlphaFix` hit lines.
+
+### Rain emission cap (`RainEmitCap`)
+
+On CrossOver/D3DMetal the worst rain drops are CPU-bound in Contracts' original
+rain vertex builder, not in `Present` or draw submission. `RainEmitCap=N`
+clamps the number of rain quads emitted by one visible rain pass before that hot
+loop runs. It is off by default because low values can thin dense rain; start
+with 512 or 384 and compare the same camera angle against `0`.
+
+`RainSystemCap=N` is the second-stage limiter for scenes where no single pass is
+huge but many visible rain systems stack up. It skips visible rain systems after
+the per-frame cap, before the particle builder runs. Lower values are faster but
+can thin rain more obviously.
 
 Install output: loader `d3d8.dll` (game root); `scripts/HMCWidescreen.asi` +
 `.ini`; logs `scripts/HMCAsiLoader.log`, `scripts/HMCWidescreen.log`.
@@ -427,6 +460,18 @@ be exercised without launching the game. For the real game, launch through
 Steam and inspect `scripts/HMCAsiLoader.log` and `scripts/HMCWidescreen.log`:
 they record the requested vs. applied presentation parameters and the
 `CreateDevice` result.
+
+### Rain / draw-cost probe
+
+For rainy-scene performance captures, enable the loader's opt-in draw probe with
+`HMC_DRAWSTATS=1` or by creating an empty `scripts/DRAWSTATS` marker file before
+launch. `scripts/HMCAsiLoader.log` then emits one line per 60-frame window with
+FPS, draw counts, dynamic-VB lock counts/time, Present time, rain-system count,
+rain cap hits, and a `DRAW-hot` line listing the hottest draw-call RVAs as `count/up` (`up`
+means `Draw*PrimitiveUP`). Compare a clear window and a rainy dip: high
+`present` with flat locks points at GPU/fill or post-processing cost, while high
+`up`/hot rain draw sites points at CPU/driver submission and gives the exact RVA
+range to patch or batch.
 
 ### x87 translation (`tests/difftest.c`)
 

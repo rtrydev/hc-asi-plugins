@@ -31,6 +31,7 @@
 #include <d3d8.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "hmc_d3d8.h"
 
@@ -39,11 +40,21 @@
 #define IDX_D3D8_CREATEDEVICE   15
 #define IDX_DEV_RESET           14
 #define IDX_DEV_PRESENT         15
+#define IDX_DEV_CREATEVB        23
 #define IDX_DEV_CREATETEXTURE   20
 #define IDX_DEV_CREATERENDERTGT 25
 #define IDX_DEV_CREATEIMAGESURF 27
+#define IDX_DEV_SETRENDERTARGET 31
 #define IDX_DEV_SETTRANSFORM    37
 #define IDX_DEV_SETVIEWPORT     40
+#define IDX_DEV_SETRENDERSTATE  50
+#define IDX_DEV_SETTEXTURE      61
+#define IDX_DEV_DRAWPRIM        70
+#define IDX_DEV_DRAWINDEXPRIM   71
+#define IDX_DEV_DRAWPRIMUP      72
+#define IDX_DEV_DRAWINDEXPRIMUP 73
+/* IDirect3DVertexBuffer8: IUnknown(0..2) + IDirect3DResource8(3..10) + Lock(11) */
+#define IDX_VB_LOCK             11
 
 static FILE *g_log;
 static char g_dir[MAX_PATH];        /* game directory (location of this dll) */
@@ -61,9 +72,111 @@ static void *g_orig_setviewport;
 static void *g_orig_createtexture;
 static void *g_orig_createrendertgt;
 static void *g_orig_createimagesurf;
+static void *g_orig_setrendertarget;
+static void *g_orig_setrenderstate;
+static void *g_orig_settexture;
 static unsigned int g_bbw, g_bbh;   /* backbuffer size of the live device */
 static int g_vp_logs, g_proj_logs;  /* diagnostic sample counters */
 static int g_rt_logs;               /* render-target creation log counter */
+
+/* Post-filter alpha repair. On the CrossOver D3D->Metal stack the A8
+ * render-target alpha that fixes Contracts's ground/detail blending also
+ * leaves the game's post-filter composite at alpha ~= 0, so its final
+ * SRCALPHA blend contributes nothing. Opt-in only: when enabled, draws that
+ * blend a render-target texture back to the backbuffer with SRCBLEND=SRCALPHA
+ * are submitted with SRCBLEND=ONE, then the logical game state is restored.
+ * Ordinary alpha-blended geometry/HUD textures are not render-target textures,
+ * so they do not match this gate. */
+static int g_postfx_alpha_fix;
+static IDirect3DSurface8 *g_backbuffer;
+static int g_rt_is_backbuffer = 1;
+static int g_stage0_is_rttex;
+static UINT g_stage0_rt_w, g_stage0_rt_h;
+static D3DFORMAT g_stage0_rt_fmt;
+static int g_alpha_blend;
+static DWORD g_srcblend = D3DBLEND_ONE;
+static unsigned int g_postfx_alpha_hits;
+static unsigned int g_postfx_probe_logs;
+
+#define MAX_RT_TEX 64
+typedef struct { IDirect3DBaseTexture8 *tex; UINT w, h; D3DFORMAT fmt; } RTTex;
+static RTTex g_rt_tex[MAX_RT_TEX];
+static int g_n_rt_tex;
+
+/* ---- draw/lock diagnostic (HMC_DRAWSTATS=1) --------------------------
+ * Opt-in per-frame instrumentation to settle whether a heavy scene (e.g.
+ * rain) is CPU/dynamic-VB-lock bound or GPU/fill bound. Every window of
+ * DRAWSTATS_WINDOW frames it logs, to HMCAsiLoader.log, the window's fps and
+ * per-frame draw count, VB-lock count (and the DISCARD subset), time spent
+ * inside VB Lock, and time spent inside Present. The fps of each line is
+ * self-correlating: rainy stretches show up as the low-fps lines, so a
+ * side-by-side read of a rainy vs. clear capture answers A (locks/locktime
+ * jump with fps) vs. B (locks flat, present time grows). Off => none of the
+ * hot-path slots are wrapped, so play is untouched. */
+#define DRAWSTATS_WINDOW 60
+static int g_drawstats;               /* HMC_DRAWSTATS=1 enables the probe */
+static void *g_orig_createvb;
+static void *g_orig_vblock;
+static void *g_orig_drawprim;
+static void *g_orig_drawindexprim;
+static void *g_orig_drawprimup;
+static void *g_orig_drawindexprimup;
+static int g_vb_lock_patched;
+static LARGE_INTEGER g_qpf;           /* QPC frequency, queried once */
+static LARGE_INTEGER g_last_frame_end;/* QPC at the previous Present return */
+/* per-frame accumulators, folded into the window at each Present */
+static unsigned int g_f_draws, g_f_vblocks, g_f_discards;
+static unsigned int g_f_dip, g_f_up;   /* indexed vs user-pointer draw split */
+static LONGLONG g_f_lock_ticks, g_f_draw_ticks;
+/* per-window accumulators */
+static int g_win_frames;
+static double g_win_ms_sum, g_win_ms_max;
+static unsigned int g_win_draws, g_win_vblocks, g_win_discards;
+static unsigned int g_win_dip, g_win_up;
+static LONGLONG g_win_lock_ticks, g_win_present_ticks, g_win_draw_ticks;
+
+#define MAX_DRAW_SITES 64
+typedef struct { uint32_t rva; unsigned int count, up; } DrawSite;
+static DrawSite g_draw_sites[MAX_DRAW_SITES];
+static int g_n_draw_sites;
+static unsigned int g_draw_site_total;
+
+/* Rain-system probe: the rain particle renderer (exe+0x1d9a90) calls the
+ * transform helper exe+0x21d750 exactly once per rain "system"/layer, at the
+ * single call site exe+0x1da403. Redirecting only that one call site to a tiny
+ * counter stub reveals how many rain systems are drawn per frame — the datum
+ * needed to decide whether cutting whole layers is viable. 0x21d750 has 279
+ * callers module-wide; we touch none of them, only this call. */
+#define RAIN_CALLSITE_RVA 0x1da403
+#define RAIN_HELPER_RVA   0x21d750
+static volatile unsigned int g_rain_sys_frame;  /* reset each Present */
+static unsigned int g_win_rainsys;
+static unsigned char *g_rain_cave;
+
+/* Experimental rain CPU limiter. The profiler shows worst-case rain time in
+ * the per-particle vertex builder at exe+0x1daa00..0x1dadff. Just before that
+ * loop, the game stores the number of rain quads to emit at [esp+0x40]. When
+ * RainEmitCap is set, a tiny runtime patch clamps that count before the loop
+ * starts. This keeps the renderer/state path intact and only limits bursty
+ * geometry generation. */
+#define RAIN_EMITCAP_RVA 0x1da93a
+static int g_rain_emit_cap;
+static volatile unsigned int g_rain_cap_frame;
+static unsigned int g_win_raincaps;
+static unsigned char *g_rain_cap_cave;
+
+/* A lower-level cap for the same renderer: after the game has decided a rain
+ * system is visible but before it enters the expensive particle builder, limit
+ * how many visible systems are processed in the current frame. This addresses
+ * the common 35-45fps case where many systems each stay under RainEmitCap. */
+#define RAIN_VISIBLE_GATE_RVA 0x1da4c0
+#define RAIN_VISIBLE_CONT_RVA 0x1da4c6
+#define RAIN_VISIBLE_SKIP_RVA 0x1dae06
+static int g_rain_system_cap;
+static volatile unsigned int g_rain_visible_frame;
+static volatile unsigned int g_rain_sysskip_frame;
+static unsigned int g_win_rainvisible, g_win_rainsysskip;
+static unsigned char *g_rain_system_cave;
 
 static void logf_(const char *fmt, ...)
 {
@@ -74,6 +187,93 @@ static void logf_(const char *fmt, ...)
     va_end(ap);
     fputc('\n', g_log);
     fflush(g_log);
+}
+
+typedef ULONG (WINAPI *rel_t)(void *);
+
+static void release_iunknown(void *p)
+{
+    if (p) ((rel_t)(*(void ***)p)[2])(p);
+}
+
+static void remember_rt_texture(IDirect3DBaseTexture8 *tex, UINT w, UINT h,
+                                D3DFORMAT fmt)
+{
+    if (!tex) return;
+    for (int i = 0; i < g_n_rt_tex; i++) {
+        if (g_rt_tex[i].tex == tex) {
+            g_rt_tex[i].w = w; g_rt_tex[i].h = h; g_rt_tex[i].fmt = fmt;
+            return;
+        }
+    }
+    int i = g_n_rt_tex < MAX_RT_TEX ? g_n_rt_tex++ : 0;
+    g_rt_tex[i].tex = tex;
+    g_rt_tex[i].w = w;
+    g_rt_tex[i].h = h;
+    g_rt_tex[i].fmt = fmt;
+}
+
+static RTTex *find_rt_texture(IDirect3DBaseTexture8 *tex)
+{
+    if (!tex) return NULL;
+    for (int i = 0; i < g_n_rt_tex; i++)
+        if (g_rt_tex[i].tex == tex) return &g_rt_tex[i];
+    return NULL;
+}
+
+static void capture_backbuffer(IDirect3DDevice8 *dev)
+{
+    typedef HRESULT (WINAPI *gb_t)(IDirect3DDevice8 *, UINT,
+        D3DBACKBUFFER_TYPE, IDirect3DSurface8 **);
+    if (g_backbuffer) {
+        release_iunknown(g_backbuffer);
+        g_backbuffer = NULL;
+    }
+    if (dev)
+        ((gb_t)(*(void ***)dev)[16])(dev, 0, D3DBACKBUFFER_TYPE_MONO,
+                                     &g_backbuffer);
+    g_rt_is_backbuffer = 1;
+}
+
+static int read_postfx_alpha_ini(void)
+{
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\scripts\\HMCWidescreen.ini", g_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[128];
+    int enabled = 0, b;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, " PostFilterAlphaFix = %d", &b) == 1 ||
+            sscanf(line, " PostFilterAlphaFix=%d", &b) == 1) {
+            enabled = b != 0;
+            break;
+        }
+    }
+    fclose(f);
+    return enabled;
+}
+
+static int read_int_ini(const char *name, int def)
+{
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\scripts\\HMCWidescreen.ini", g_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return def;
+    char line[128], lhs[64];
+    int value = def;
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        lhs[0] = 0;
+        if ((sscanf(line, " %63[^= ] = %d", lhs, &v) == 2 ||
+             sscanf(line, " %63s %d", lhs, &v) == 2) &&
+            _stricmp(lhs, name) == 0) {
+            value = v;
+            break;
+        }
+    }
+    fclose(f);
+    return value;
 }
 
 static FARPROC resolve(const char *name)
@@ -132,7 +332,11 @@ static HRESULT WINAPI hook_CreateTexture(IDirect3DDevice8 *self, UINT W, UINT H,
               (uint8_t *)__builtin_return_address(0) -
               (uint8_t *)GetModuleHandleA(NULL));
     }
-    return ((ct_t)g_orig_createtexture)(self, W, H, Levels, Usage, Fmt, Pool, pp);
+    HRESULT hr = ((ct_t)g_orig_createtexture)(self, W, H, Levels, Usage, Fmt,
+                                              Pool, pp);
+    if (SUCCEEDED(hr) && pp && *pp && (Usage & D3DUSAGE_RENDERTARGET))
+        remember_rt_texture((IDirect3DBaseTexture8 *)*pp, W, H, Fmt);
+    return hr;
 }
 
 static HRESULT WINAPI hook_CreateRenderTarget(IDirect3DDevice8 *self, UINT W,
@@ -164,6 +368,488 @@ static HRESULT WINAPI hook_CreateImageSurface(IDirect3DDevice8 *self, UINT W,
               (uint8_t *)GetModuleHandleA(NULL));
     }
     return ((ci_t)g_orig_createimagesurf)(self, W, H, Fmt, pp);
+}
+
+static HRESULT WINAPI hook_SetRenderTarget(IDirect3DDevice8 *self,
+    IDirect3DSurface8 *rt, IDirect3DSurface8 *zs)
+{
+    typedef HRESULT (WINAPI *srt_t)(IDirect3DDevice8 *, IDirect3DSurface8 *,
+        IDirect3DSurface8 *);
+    g_rt_is_backbuffer = (!rt || (g_backbuffer && rt == g_backbuffer));
+    return ((srt_t)g_orig_setrendertarget)(self, rt, zs);
+}
+
+static HRESULT WINAPI hook_SetRenderState(IDirect3DDevice8 *self,
+    D3DRENDERSTATETYPE State, DWORD Value)
+{
+    typedef HRESULT (WINAPI *srs_t)(IDirect3DDevice8 *, D3DRENDERSTATETYPE,
+        DWORD);
+    if (State == D3DRS_ALPHABLENDENABLE) g_alpha_blend = Value != 0;
+    else if (State == D3DRS_SRCBLEND) g_srcblend = Value;
+    return ((srs_t)g_orig_setrenderstate)(self, State, Value);
+}
+
+static HRESULT WINAPI hook_SetTexture(IDirect3DDevice8 *self, DWORD stage,
+    IDirect3DBaseTexture8 *tex)
+{
+    typedef HRESULT (WINAPI *stex_t)(IDirect3DDevice8 *, DWORD,
+        IDirect3DBaseTexture8 *);
+    if (stage == 0) {
+        RTTex *rt = find_rt_texture(tex);
+        g_stage0_is_rttex = rt != NULL;
+        g_stage0_rt_w = rt ? rt->w : 0;
+        g_stage0_rt_h = rt ? rt->h : 0;
+        g_stage0_rt_fmt = rt ? rt->fmt : 0;
+    }
+    return ((stex_t)g_orig_settexture)(self, stage, tex);
+}
+
+static int postfx_alpha_active(void)
+{
+    return g_postfx_alpha_fix && g_rt_is_backbuffer && g_stage0_is_rttex &&
+           g_alpha_blend && g_srcblend == D3DBLEND_SRCALPHA;
+}
+
+static HRESULT postfx_alpha_draw(IDirect3DDevice8 *self, void *ret,
+    HRESULT (WINAPI *drawfn)(void *ctx), void *ctx)
+{
+    typedef HRESULT (WINAPI *srs_t)(IDirect3DDevice8 *, D3DRENDERSTATETYPE,
+        DWORD);
+    if (!postfx_alpha_active())
+        return drawfn(ctx);
+
+    srs_t setrs = (srs_t)g_orig_setrenderstate;
+    if (g_postfx_alpha_hits < 8) {
+        uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+        logf_("PostFilterAlphaFix: SRCALPHA -> ONE for RT-texture composite "
+              "at exe+0x%tx", base ? (uint8_t *)ret - base : 0);
+    }
+    g_postfx_alpha_hits++;
+    setrs(self, D3DRS_SRCBLEND, D3DBLEND_ONE);
+    HRESULT hr = drawfn(ctx);
+    setrs(self, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    return hr;
+}
+
+static void drawsite_hit(void *ret, int is_up)
+{
+    if (!g_drawstats) return;
+    uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+    if (!base) return;
+    uint32_t rva = (uint32_t)((uint8_t *)ret - base) & ~0xFu;
+    g_draw_site_total++;
+    for (int i = 0; i < g_n_draw_sites; i++) {
+        if (g_draw_sites[i].rva == rva) {
+            g_draw_sites[i].count++;
+            if (is_up) g_draw_sites[i].up++;
+            return;
+        }
+    }
+    if (g_n_draw_sites < MAX_DRAW_SITES) {
+        g_draw_sites[g_n_draw_sites].rva = rva;
+        g_draw_sites[g_n_draw_sites].count = 1;
+        g_draw_sites[g_n_draw_sites].up = is_up ? 1 : 0;
+        g_n_draw_sites++;
+    }
+}
+
+static void drawsite_top(char *buf, size_t n)
+{
+    buf[0] = 0;
+    size_t off = 0;
+    int used[MAX_DRAW_SITES] = {0};
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < g_n_draw_sites; i++)
+            if (!used[i] &&
+                (best < 0 || g_draw_sites[i].count > g_draw_sites[best].count))
+                best = i;
+        if (best < 0 || !g_draw_sites[best].count) break;
+        used[best] = 1;
+        int pct = g_draw_site_total ?
+            (int)((g_draw_sites[best].count * 100 + g_draw_site_total / 2) /
+                  g_draw_site_total) : 0;
+        int w = snprintf(buf + off, n - off, "%sexe+0x%x=%u/%u%s",
+                         off ? " " : "", g_draw_sites[best].rva,
+                         g_draw_sites[best].count, g_draw_sites[best].up,
+                         pct >= 2 ? "" : "*");
+        if (w < 0 || (size_t)w >= n - off) break;
+        off += w;
+    }
+}
+
+/* ---- draw/lock diagnostic hooks (only patched in when g_drawstats) ---- */
+
+/* IDirect3DVertexBuffer8::Lock — time the forwarded call and tally DISCARDs.
+ * On the D3D->Metal stack a dynamic-VB DISCARD reallocates/flushes per lock
+ * (~65us measured previously), so this is where the "A" (lock-churn) cost
+ * lands. All VBs share one COM vtable, so slot 11 is patched once. */
+static HRESULT WINAPI hook_VBLock(IDirect3DVertexBuffer8 *self, UINT off,
+    UINT size, BYTE **ppb, DWORD flags)
+{
+    typedef HRESULT (WINAPI *lk_t)(IDirect3DVertexBuffer8 *, UINT, UINT,
+        BYTE **, DWORD);
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    HRESULT hr = ((lk_t)g_orig_vblock)(self, off, size, ppb, flags);
+    QueryPerformanceCounter(&b);
+    g_f_vblocks++;
+    if (flags & D3DLOCK_DISCARD) g_f_discards++;
+    g_f_lock_ticks += b.QuadPart - a.QuadPart;
+    return hr;
+}
+
+static HRESULT WINAPI hook_CreateVertexBuffer(IDirect3DDevice8 *self,
+    UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool,
+    IDirect3DVertexBuffer8 **pp)
+{
+    typedef HRESULT (WINAPI *cv_t)(IDirect3DDevice8 *, UINT, DWORD, DWORD,
+        D3DPOOL, IDirect3DVertexBuffer8 **);
+    HRESULT hr = ((cv_t)g_orig_createvb)(self, Length, Usage, FVF, Pool, pp);
+    if (SUCCEEDED(hr) && pp && *pp && !g_vb_lock_patched) {
+        patch_slot(*pp, IDX_VB_LOCK, (void *)hook_VBLock, &g_orig_vblock);
+        g_vb_lock_patched = 1;
+        logf_("DRAWSTATS: VB Lock wrapped (shared vtable) — lock timing live");
+    }
+    return hr;
+}
+
+/* The four draw entrypoints time the forwarded call (draw-exec: GPU/driver
+ * submission cost lands here, not in Present) and split stream-buffer draws
+ * (DrawPrimitive/DrawIndexedPrimitive) from user-pointer draws
+ * (DrawPrimitiveUP/DrawIndexedPrimitiveUP — what particle systems typically
+ * use, which is why they add draws without adding VB DISCARDs). */
+static void drawstats_account(LONGLONG ticks, int is_up)
+{
+    if (!g_drawstats) return;
+    g_f_draws++;
+    if (is_up) g_f_up++; else g_f_dip++;
+    g_f_draw_ticks += ticks;
+}
+
+typedef struct {
+    IDirect3DDevice8 *self;
+    D3DPRIMITIVETYPE t;
+    UINT a, b, c, d, e;
+    CONST void *p, *q;
+    D3DFORMAT fmt;
+    UINT stride;
+} DrawCtx;
+
+static HRESULT WINAPI call_DrawPrimitive(void *v)
+{
+    DrawCtx *c = (DrawCtx *)v;
+    typedef HRESULT (WINAPI *dp_t)(IDirect3DDevice8 *, D3DPRIMITIVETYPE, UINT,
+        UINT);
+    return ((dp_t)g_orig_drawprim)(c->self, c->t, c->a, c->b);
+}
+
+static HRESULT WINAPI call_DrawIndexedPrimitive(void *v)
+{
+    DrawCtx *c = (DrawCtx *)v;
+    typedef HRESULT (WINAPI *di_t)(IDirect3DDevice8 *, D3DPRIMITIVETYPE, UINT,
+        UINT, UINT, UINT);
+    return ((di_t)g_orig_drawindexprim)(c->self, c->t, c->a, c->b, c->c, c->d);
+}
+
+static HRESULT WINAPI call_DrawPrimitiveUP(void *v)
+{
+    DrawCtx *c = (DrawCtx *)v;
+    typedef HRESULT (WINAPI *du_t)(IDirect3DDevice8 *, D3DPRIMITIVETYPE, UINT,
+        CONST void *, UINT);
+    return ((du_t)g_orig_drawprimup)(c->self, c->t, c->a, c->p, c->stride);
+}
+
+static HRESULT WINAPI call_DrawIndexedPrimitiveUP(void *v)
+{
+    DrawCtx *c = (DrawCtx *)v;
+    typedef HRESULT (WINAPI *diu_t)(IDirect3DDevice8 *, D3DPRIMITIVETYPE, UINT,
+        UINT, UINT, CONST void *, D3DFORMAT, CONST void *, UINT);
+    return ((diu_t)g_orig_drawindexprimup)(c->self, c->t, c->a, c->b, c->c,
+                                           c->p, c->fmt, c->q, c->stride);
+}
+
+static HRESULT timed_draw(IDirect3DDevice8 *self, void *ret,
+    HRESULT (WINAPI *fn)(void *), DrawCtx *ctx, int is_up)
+{
+    LARGE_INTEGER a, b;
+    if (g_drawstats) {
+        drawsite_hit(ret, is_up);
+        QueryPerformanceCounter(&a);
+    }
+    if (g_postfx_alpha_fix && g_stage0_is_rttex && g_postfx_probe_logs < 24) {
+        uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+        logf_("PostFilterAlphaFix probe: RT texture draw at exe+0x%tx "
+              "tex=%ux%u fmt=%d target=%s alpha=%d srcblend=%lu",
+              base ? (uint8_t *)ret - base : 0,
+              g_stage0_rt_w, g_stage0_rt_h, g_stage0_rt_fmt,
+              g_rt_is_backbuffer ? "backbuffer" : "rt",
+              g_alpha_blend, (unsigned long)g_srcblend);
+        g_postfx_probe_logs++;
+    }
+    HRESULT hr = postfx_alpha_draw(self, ret, fn, ctx);
+    if (g_drawstats) {
+        QueryPerformanceCounter(&b);
+        drawstats_account(b.QuadPart - a.QuadPart, is_up);
+    }
+    return hr;
+}
+
+static HRESULT WINAPI hook_DrawPrimitive(IDirect3DDevice8 *self,
+    D3DPRIMITIVETYPE t, UINT start, UINT count)
+{
+    DrawCtx c = {0};
+    c.self = self; c.t = t; c.a = start; c.b = count;
+    return timed_draw(self, __builtin_return_address(0), call_DrawPrimitive,
+                      &c, 0);
+}
+
+static HRESULT WINAPI hook_DrawIndexedPrimitive(IDirect3DDevice8 *self,
+    D3DPRIMITIVETYPE t, UINT minIdx, UINT numV, UINT startIdx, UINT count)
+{
+    DrawCtx c = {0};
+    c.self = self; c.t = t; c.a = minIdx; c.b = numV;
+    c.c = startIdx; c.d = count;
+    return timed_draw(self, __builtin_return_address(0),
+                      call_DrawIndexedPrimitive, &c, 0);
+}
+
+static HRESULT WINAPI hook_DrawPrimitiveUP(IDirect3DDevice8 *self,
+    D3DPRIMITIVETYPE t, UINT count, CONST void *data, UINT stride)
+{
+    DrawCtx c = {0};
+    c.self = self; c.t = t; c.a = count; c.p = data; c.stride = stride;
+    return timed_draw(self, __builtin_return_address(0), call_DrawPrimitiveUP,
+                      &c, 1);
+}
+
+static HRESULT WINAPI hook_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self,
+    D3DPRIMITIVETYPE t, UINT minV, UINT numV, UINT count, CONST void *idx,
+    D3DFORMAT idxFmt, CONST void *data, UINT stride)
+{
+    DrawCtx c = {0};
+    c.self = self; c.t = t; c.a = minV; c.b = numV; c.c = count;
+    c.p = idx; c.q = data; c.fmt = idxFmt; c.stride = stride;
+    return timed_draw(self, __builtin_return_address(0),
+                      call_DrawIndexedPrimitiveUP, &c, 1);
+}
+
+/* Install the rain-system counter by repointing the single call site's rel32
+ * to a stub that does `inc [g_rain_sys_frame]; push helper; ret`. The stub
+ * clobbers no registers (only flags, irrelevant across a call boundary) and
+ * leaves the stack exactly as a direct `call 0x21d750` would, so 0x21d750 runs
+ * unchanged. Verifies the bytes first, so a different build is left alone. */
+static void arm_rain_probe(void)
+{
+    unsigned char *base = (unsigned char *)GetModuleHandleA(NULL);
+    if (!base) return;
+    unsigned char *site = base + RAIN_CALLSITE_RVA;
+    if (site[0] != 0xE8) {
+        logf_("rainprobe: exe+0x%x is 0x%02x not a call — not arming "
+              "(build mismatch)", RAIN_CALLSITE_RVA, site[0]);
+        return;
+    }
+    unsigned char *target = site + 5 + *(int *)(site + 1);
+    if (target != base + RAIN_HELPER_RVA) {
+        logf_("rainprobe: call target exe+0x%tx != 0x%x — not arming",
+              target - base, RAIN_HELPER_RVA);
+        return;
+    }
+    unsigned char *cave = (unsigned char *)VirtualAlloc(NULL, 16,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!cave) return;
+    cave[0] = 0xFF; cave[1] = 0x05;                       /* inc dword [imm32] */
+    *(unsigned int *)(cave + 2) = (unsigned int)(uintptr_t)&g_rain_sys_frame;
+    cave[6] = 0x68;                                        /* push imm32       */
+    *(unsigned int *)(cave + 7) = (unsigned int)(uintptr_t)target;
+    cave[11] = 0xC3;                                       /* ret              */
+    g_rain_cave = cave;
+    DWORD old;
+    if (VirtualProtect(site + 1, 4, PAGE_EXECUTE_READWRITE, &old)) {
+        *(int *)(site + 1) = (int)(cave - (site + 5));
+        VirtualProtect(site + 1, 4, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+        logf_("rainprobe: armed at exe+0x%x (cave %p) — per-frame rain-system "
+              "count live", RAIN_CALLSITE_RVA, cave);
+    }
+}
+
+static void arm_rain_emit_cap(void)
+{
+    unsigned char *base = (unsigned char *)GetModuleHandleA(NULL);
+    if (!base || g_rain_emit_cap <= 0) return;
+
+    unsigned char *site = base + RAIN_EMITCAP_RVA;
+    if (site[0] != 0x8B || site[1] != 0x44 || site[2] != 0x24 ||
+        site[3] != 0x40 || site[4] != 0xDD || site[5] != 0xD8) {
+        logf_("RainEmitCap: exe+0x%x bytes are %02x %02x %02x %02x %02x %02x, "
+              "not expected — not patching (build mismatch)",
+              RAIN_EMITCAP_RVA, site[0], site[1], site[2], site[3], site[4],
+              site[5]);
+        return;
+    }
+
+    unsigned char *cave = (unsigned char *)VirtualAlloc(NULL, 48,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!cave) {
+        logf_("RainEmitCap: VirtualAlloc failed");
+        return;
+    }
+
+    unsigned int cap = (unsigned int)g_rain_emit_cap;
+    int p = 0;
+    cave[p++] = 0x8B; cave[p++] = 0x44; cave[p++] = 0x24; cave[p++] = 0x40;
+    cave[p++] = 0x3D; *(unsigned int *)(cave + p) = cap; p += 4;
+    cave[p++] = 0x76; cave[p++] = 0x13;                 /* jbe keep_count */
+    cave[p++] = 0xFF; cave[p++] = 0x05;                 /* inc [hits] */
+    *(unsigned int *)(cave + p) =
+        (unsigned int)(uintptr_t)&g_rain_cap_frame; p += 4;
+    cave[p++] = 0xC7; cave[p++] = 0x44; cave[p++] = 0x24; cave[p++] = 0x40;
+    *(unsigned int *)(cave + p) = cap; p += 4;           /* [esp+40]=cap */
+    cave[p++] = 0xB8; *(unsigned int *)(cave + p) = cap; p += 4;
+    cave[p++] = 0xDD; cave[p++] = 0xD8;                 /* fstp st(0) */
+    cave[p++] = 0xE9;
+    *(int *)(cave + p) = (int)((base + RAIN_EMITCAP_RVA + 6) -
+                               (cave + p + 4));
+    p += 4;
+
+    DWORD old;
+    if (VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) {
+        site[0] = 0xE9;
+        *(int *)(site + 1) = (int)(cave - (site + 5));
+        site[5] = 0x90;
+        VirtualProtect(site, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), site, 6);
+        g_rain_cap_cave = cave;
+        logf_("RainEmitCap: armed at exe+0x%x, cap=%d quads/system-pass "
+              "(cave %p)", RAIN_EMITCAP_RVA, g_rain_emit_cap, cave);
+    }
+}
+
+static void arm_rain_system_cap(void)
+{
+    unsigned char *base = (unsigned char *)GetModuleHandleA(NULL);
+    if (!base || g_rain_system_cap <= 0) return;
+
+    unsigned char *site = base + RAIN_VISIBLE_GATE_RVA;
+    if (site[0] != 0x0F || site[1] != 0x85 ||
+        *(int *)(site + 2) !=
+            (int)((base + RAIN_VISIBLE_SKIP_RVA) - (site + 6))) {
+        logf_("RainSystemCap: exe+0x%x bytes are %02x %02x %02x %02x %02x %02x, "
+              "not expected — not patching (build mismatch)",
+              RAIN_VISIBLE_GATE_RVA, site[0], site[1], site[2], site[3],
+              site[4], site[5]);
+        return;
+    }
+
+    unsigned char *cave = (unsigned char *)VirtualAlloc(NULL, 64,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!cave) {
+        logf_("RainSystemCap: VirtualAlloc failed");
+        return;
+    }
+
+    unsigned int cap = (unsigned int)g_rain_system_cap;
+    unsigned char *skip = base + RAIN_VISIBLE_SKIP_RVA;
+    unsigned char *cont = base + RAIN_VISIBLE_CONT_RVA;
+    int p = 0;
+    cave[p++] = 0x0F; cave[p++] = 0x85;                 /* jne original skip */
+    *(int *)(cave + p) = (int)(skip - (cave + p + 4)); p += 4;
+    cave[p++] = 0xFF; cave[p++] = 0x05;                 /* inc [visible] */
+    *(unsigned int *)(cave + p) =
+        (unsigned int)(uintptr_t)&g_rain_visible_frame; p += 4;
+    cave[p++] = 0xA1;                                   /* mov eax,[visible] */
+    *(unsigned int *)(cave + p) =
+        (unsigned int)(uintptr_t)&g_rain_visible_frame; p += 4;
+    cave[p++] = 0x3D; *(unsigned int *)(cave + p) = cap; p += 4;
+    cave[p++] = 0x76; cave[p++] = 0x0B;                 /* jbe continue */
+    cave[p++] = 0xFF; cave[p++] = 0x05;                 /* inc [skipped] */
+    *(unsigned int *)(cave + p) =
+        (unsigned int)(uintptr_t)&g_rain_sysskip_frame; p += 4;
+    cave[p++] = 0xE9;
+    *(int *)(cave + p) = (int)(skip - (cave + p + 4)); p += 4;
+    cave[p++] = 0xE9;
+    *(int *)(cave + p) = (int)(cont - (cave + p + 4)); p += 4;
+
+    DWORD old;
+    if (VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) {
+        site[0] = 0xE9;
+        *(int *)(site + 1) = (int)(cave - (site + 5));
+        site[5] = 0x90;
+        VirtualProtect(site, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), site, 6);
+        g_rain_system_cave = cave;
+        logf_("RainSystemCap: armed at exe+0x%x, cap=%d visible systems/frame "
+              "(cave %p)", RAIN_VISIBLE_GATE_RVA, g_rain_system_cap, cave);
+    }
+}
+
+/* Fold the just-finished frame into the window; log every DRAWSTATS_WINDOW
+ * frames. Called from hook_Present with the QPC stamps bracketing the real
+ * Present (t0..t1); t1 also serves as the present-to-present frame boundary. */
+static void drawstats_frame(LARGE_INTEGER t0, LARGE_INTEGER t1)
+{
+    g_win_present_ticks += t1.QuadPart - t0.QuadPart;
+    if (g_last_frame_end.QuadPart) {
+        double ms = (double)(t1.QuadPart - g_last_frame_end.QuadPart) * 1000.0
+                    / (double)g_qpf.QuadPart;
+        g_win_ms_sum += ms;
+        if (ms > g_win_ms_max) g_win_ms_max = ms;
+        g_win_frames++;
+    }
+    g_last_frame_end = t1;
+
+    g_win_draws    += g_f_draws;
+    g_win_dip      += g_f_dip;
+    g_win_up       += g_f_up;
+    g_win_vblocks  += g_f_vblocks;
+    g_win_discards += g_f_discards;
+    g_win_lock_ticks += g_f_lock_ticks;
+    g_win_draw_ticks += g_f_draw_ticks;
+    g_win_rainsys += g_rain_sys_frame;
+    g_win_raincaps += g_rain_cap_frame;
+    g_win_rainvisible += g_rain_visible_frame;
+    g_win_rainsysskip += g_rain_sysskip_frame;
+    g_f_draws = g_f_vblocks = g_f_discards = g_f_dip = g_f_up = 0;
+    g_f_lock_ticks = g_f_draw_ticks = 0;
+    g_rain_sys_frame = 0;
+    g_rain_cap_frame = 0;
+    g_rain_visible_frame = 0;
+    g_rain_sysskip_frame = 0;
+
+    if (g_win_frames >= DRAWSTATS_WINDOW) {
+        double avg_ms = g_win_ms_sum / g_win_frames;
+        double q = (double)g_qpf.QuadPart;
+        int n = g_win_frames;
+        char drawtops[256];
+        drawsite_top(drawtops, sizeof(drawtops));
+        logf_("DRAWSTATS %.0ffps avg %.2fms (worst %.2fms) | draws %.0f/f "
+              "[strm %.0f up %.0f] exec %.2fms/f | vblk %.0f disc %.0f "
+              "lock %.2fms/f | present %.2fms/f | rainsys %.1f/f cap %.1f/f "
+              "vis %.1f/f skip %.1f/f",
+              avg_ms > 0 ? 1000.0 / avg_ms : 0.0, avg_ms, g_win_ms_max,
+              (double)g_win_draws / n, (double)g_win_dip / n,
+              (double)g_win_up / n,
+              (double)g_win_draw_ticks * 1000.0 / q / n,
+              (double)g_win_vblocks / n, (double)g_win_discards / n,
+              (double)g_win_lock_ticks * 1000.0 / q / n,
+              (double)g_win_present_ticks * 1000.0 / q / n,
+              (double)g_win_rainsys / n, (double)g_win_raincaps / n,
+              (double)g_win_rainvisible / n,
+              (double)g_win_rainsysskip / n);
+        if (drawtops[0])
+            logf_("  DRAW-hot: %s (format count/up; * = <2%% of draws)",
+                  drawtops);
+        g_win_frames = 0;
+        g_win_ms_sum = g_win_ms_max = 0;
+        g_win_draws = g_win_vblocks = g_win_discards = g_win_dip = g_win_up = 0;
+        g_win_lock_ticks = g_win_present_ticks = g_win_draw_ticks = 0;
+        g_win_rainsys = 0;
+        g_win_raincaps = 0;
+        g_win_rainvisible = g_win_rainsysskip = 0;
+        g_n_draw_sites = 0;
+        g_draw_site_total = 0;
+    }
 }
 
 static HRESULT WINAPI hook_SetViewport(IDirect3DDevice8 *self,
@@ -243,7 +929,14 @@ static HRESULT WINAPI hook_Present(IDirect3DDevice8 *self,
     for (int i = 0; i < g_n_hooks; i++)
         if (g_hooks[i].on_frame)
             g_hooks[i].on_frame(self);
+    LARGE_INTEGER t0;
+    if (g_drawstats) QueryPerformanceCounter(&t0);
     HRESULT hr = ((pr_t)g_orig_present)(self, src, dst, override, dirty);
+    if (g_drawstats) {
+        LARGE_INTEGER t1;
+        QueryPerformanceCounter(&t1);
+        drawstats_frame(t0, t1);
+    }
     /* One displayed frame just finished; let plugins pace the frame rate
      * (the engine's simulation is frame-time bound). */
     for (int i = 0; i < g_n_hooks; i++)
@@ -261,7 +954,10 @@ static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
             if (g_hooks[i].fix_present)
                 g_hooks[i].fix_present(pp, NULL, 1);
     if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
-    return ((rs_t)g_orig_reset)(self, pp);
+    HRESULT hr = ((rs_t)g_orig_reset)(self, pp);
+    if (SUCCEEDED(hr) && g_postfx_alpha_fix)
+        capture_backbuffer(self);
+    return hr;
 }
 
 static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
@@ -344,6 +1040,35 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
                    (void *)hook_CreateRenderTarget, &g_orig_createrendertgt);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CREATEIMAGESURF,
                    (void *)hook_CreateImageSurface, &g_orig_createimagesurf);
+        if (g_postfx_alpha_fix) {
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETRENDERTARGET,
+                       (void *)hook_SetRenderTarget, &g_orig_setrendertarget);
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETRENDERSTATE,
+                       (void *)hook_SetRenderState, &g_orig_setrenderstate);
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETTEXTURE,
+                       (void *)hook_SetTexture, &g_orig_settexture);
+            capture_backbuffer(*ppReturnedDeviceInterface);
+            logf_("PostFilterAlphaFix: armed (RT texture -> backbuffer "
+                  "SRCALPHA composites use ONE)");
+        }
+        if (g_drawstats) {
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CREATEVB,
+                       (void *)hook_CreateVertexBuffer, &g_orig_createvb);
+        }
+        if (g_drawstats || g_postfx_alpha_fix) {
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWPRIM,
+                       (void *)hook_DrawPrimitive, &g_orig_drawprim);
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWINDEXPRIM,
+                       (void *)hook_DrawIndexedPrimitive, &g_orig_drawindexprim);
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWPRIMUP,
+                       (void *)hook_DrawPrimitiveUP, &g_orig_drawprimup);
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWINDEXPRIMUP,
+                       (void *)hook_DrawIndexedPrimitiveUP,
+                       &g_orig_drawindexprimup);
+            if (g_drawstats)
+                logf_("DRAWSTATS: draw/lock probe armed (window=%d frames)",
+                      DRAWSTATS_WINDOW);
+        }
         for (int i = 0; i < g_n_hooks; i++)
             if (g_hooks[i].on_device)
                 g_hooks[i].on_device(*ppReturnedDeviceInterface);
@@ -467,6 +1192,65 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
                  g_dir);
         g_log = fopen(logpath, "w");
         logf_("HMC ASI Loader (d3d8.dll proxy) attached");
+        /* Enable the draw/lock probe via either HMC_DRAWSTATS=1 (env) or a
+         * marker file scripts/DRAWSTATS next to the plugins — the file is the
+         * easy toggle when the game is launched through Steam in a CrossOver
+         * bottle, where injecting an env var is awkward. */
+        char v[8] = {0};
+        char marker[MAX_PATH];
+        snprintf(marker, sizeof(marker), "%s\\scripts\\DRAWSTATS", g_dir);
+        int env_on = GetEnvironmentVariableA("HMC_DRAWSTATS", v, sizeof(v)) &&
+                     v[0] == '1';
+        int file_on = GetFileAttributesA(marker) != INVALID_FILE_ATTRIBUTES;
+        if (env_on || file_on) {
+            g_drawstats = 1;
+            QueryPerformanceFrequency(&g_qpf);
+            logf_("draw/lock/present probe ENABLED (%s; logs every %d frames)",
+                  file_on ? "scripts/DRAWSTATS marker" : "HMC_DRAWSTATS=1",
+                  DRAWSTATS_WINDOW);
+            arm_rain_probe();
+        }
+        char pfx_marker[MAX_PATH];
+        snprintf(pfx_marker, sizeof(pfx_marker),
+                 "%s\\scripts\\POSTFX_ALPHA_FIX", g_dir);
+        memset(v, 0, sizeof(v));
+        int pfx_env = GetEnvironmentVariableA("HMC_POSTFX_ALPHA_FIX", v,
+                                              sizeof(v)) && v[0] == '1';
+        int pfx_file = GetFileAttributesA(pfx_marker) != INVALID_FILE_ATTRIBUTES;
+        int pfx_ini = read_postfx_alpha_ini();
+        if (pfx_env || pfx_file || pfx_ini) {
+            g_postfx_alpha_fix = 1;
+            logf_("PostFilterAlphaFix ENABLED (%s)",
+                  pfx_ini ? "HMCWidescreen.ini" :
+                  (pfx_file ? "scripts/POSTFX_ALPHA_FIX marker" :
+                   "HMC_POSTFX_ALPHA_FIX=1"));
+        }
+        memset(v, 0, sizeof(v));
+        int rain_env = GetEnvironmentVariableA("HMC_RAIN_EMIT_CAP", v,
+                                               sizeof(v)) ? atoi(v) : 0;
+        int rain_ini = read_int_ini("RainEmitCap", 0);
+        g_rain_emit_cap = rain_env > 0 ? rain_env : rain_ini;
+        if (g_rain_emit_cap > 0) {
+            if (g_rain_emit_cap < 16) g_rain_emit_cap = 16;
+            if (g_rain_emit_cap > 4096) g_rain_emit_cap = 4096;
+            logf_("RainEmitCap ENABLED (%s, cap=%d)",
+                  rain_env > 0 ? "HMC_RAIN_EMIT_CAP" : "HMCWidescreen.ini",
+                  g_rain_emit_cap);
+            arm_rain_emit_cap();
+        }
+        memset(v, 0, sizeof(v));
+        int rsys_env = GetEnvironmentVariableA("HMC_RAIN_SYSTEM_CAP", v,
+                                               sizeof(v)) ? atoi(v) : 0;
+        int rsys_ini = read_int_ini("RainSystemCap", 0);
+        g_rain_system_cap = rsys_env > 0 ? rsys_env : rsys_ini;
+        if (g_rain_system_cap > 0) {
+            if (g_rain_system_cap < 4) g_rain_system_cap = 4;
+            if (g_rain_system_cap > 256) g_rain_system_cap = 256;
+            logf_("RainSystemCap ENABLED (%s, cap=%d)",
+                  rsys_env > 0 ? "HMC_RAIN_SYSTEM_CAP" : "HMCWidescreen.ini",
+                  g_rain_system_cap);
+            arm_rain_system_cap();
+        }
         load_asis();
     }
     return TRUE;

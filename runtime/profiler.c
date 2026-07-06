@@ -291,6 +291,47 @@ static void rest_top(char *buf, size_t n)
     }
 }
 
+/* per-window histogram of where the GAME (exe) samples land, in 256-byte
+ * RVA buckets — during a dip this concentrates on the hot engine loop, whose
+ * RVA can then be disassembled on-target to find the lever (e.g. the rain
+ * particle system). Only populated while ShowCPU=1. */
+#define MAX_EB 512
+static uint32_t g_eb_rva[MAX_EB];
+static uint32_t g_eb_cnt[MAX_EB];
+static int      g_n_eb;
+static uint32_t g_eb_total;
+
+static void game_hit(uint32_t rva)
+{
+    uint32_t b = rva & ~0xFFu;      /* 256-byte bucket */
+    g_eb_total++;
+    for (int i = 0; i < g_n_eb; i++)
+        if (g_eb_rva[i] == b) { g_eb_cnt[i]++; return; }
+    if (g_n_eb < MAX_EB) { g_eb_rva[g_n_eb] = b; g_eb_cnt[g_n_eb] = 1; g_n_eb++; }
+}
+
+/* append "exe+0xRVA=NN% ..." for the top few GAME buckets this window */
+static void game_top(char *buf, size_t n)
+{
+    buf[0] = 0;
+    size_t off = 0;
+    int used[MAX_EB] = {0};
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < g_n_eb; i++)
+            if (!used[i] && (best < 0 || g_eb_cnt[i] > g_eb_cnt[best])) best = i;
+        if (best < 0 || !g_eb_cnt[best]) break;
+        used[best] = 1;
+        int pct = g_eb_total ?
+            (int)((g_eb_cnt[best] * 100 + g_eb_total / 2) / g_eb_total) : 0;
+        if (pct < 2) break;         /* skip long tail of 1-sample buckets */
+        int w = snprintf(buf + off, n - off, "%sexe+0x%x=%d%%",
+                         off ? " " : "", g_eb_rva[best], pct);
+        if (w < 0 || (size_t)w >= n - off) break;
+        off += w;
+    }
+}
+
 static DWORD WINAPI sampler(LPVOID arg)
 {
     (void)arg;
@@ -327,6 +368,8 @@ static DWORD WINAPI sampler(LPVOID arg)
                     int cat = classify(eip);
                     cnt[cat]++;
                     if (cat == CAT_REST) rest_hit(mod_name_at(eip));
+                    else if (cat == CAT_GAME && g_game_base)
+                        game_hit(eip - g_game_base);
                 }
                 ResumeThread(rt);
             }
@@ -351,7 +394,13 @@ static DWORD WINAPI sampler(LPVOID arg)
                   "  REST-top: %s", g_fps, g_ms_avg, g_ms_max,
                   g_pct[CAT_X87], g_pct[CAT_GAME],
                   g_pct[CAT_REST], restmods[0] ? restmods : "(none)");
+            char gamehot[192];
+            game_top(gamehot, sizeof(gamehot));
+            if (gamehot[0])
+                logf_("  GAME-hot: %s", gamehot);
             g_n_rn = 0;
+            g_n_eb = 0;
+            g_eb_total = 0;
         }
         Sleep(4);       /* ~250 Hz */
     }
