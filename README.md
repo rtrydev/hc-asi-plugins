@@ -199,9 +199,16 @@ PostFilterAlphaFix=0 ; experimental D3DMetal workaround for the post-filter
                     ; vanishing with the A8 backbuffer: render-target texture
                     ; composites to the backbuffer use SRCBLEND=ONE instead of
                     ; SRCALPHA. Off by default until visually verified.
-PostFilterOpaqueRT=0 ; experimental D3DMetal workaround: keep the main A8
-                    ; backbuffer for detail textures, but create only the
-                    ; post-filter render targets as X8R8G8B8.
+PostFilterOpaqueRT=1 ; D3DMetal workaround: keep the main A8 backbuffer for
+                    ; detail textures, but create selected post-filter render
+                    ; targets as X8R8G8B8 so the bloom bright-pass (which
+                    ; multiplies scene colour by alpha) isn't zeroed.
+PostFilterOpaqueRTMask=3 ; which of the 6 post-filter RTs to force opaque
+                    ; (bitmask). Default 3 = quarter-res bloom-blur buffer
+                    ; (bit0) + full-res scene copy the bright-pass samples
+                    ; (bit1). Bits 2-5 stay A8 so the dying/slow-mo B&W
+                    ; desaturation keeps the destination alpha it ramps
+                    ; through — forcing those opaque hangs the death cam.
 RainEmitCap=0      ; experimental rain CPU limiter. 0 = off; values such as
                     ; 256/384/512 clamp the worst-case per-pass rain emission
                     ; burst before the expensive particle vertex builder.
@@ -317,8 +324,22 @@ game's logical state is restored. It can also be enabled for quick testing with
 
 `PostFilterOpaqueRT=1` targets the related A8-backbuffer regression more
 directly: the scene backbuffer remains A8R8G8B8 for destination-alpha texture
-effects, but the known post-filter render targets are created as X8R8G8B8 so
-the bloom/color-grade chain behaves like it did before the A8 backbuffer fix.
+effects, but selected post-filter render targets are created as X8R8G8B8 so the
+bloom bright-pass — which samples a full-res scene copy and multiplies colour by
+that surface's alpha — isn't multiplied by the ~0 alpha D3DMetal leaves on
+opaque geometry.
+
+`PostFilterOpaqueRTMask` chooses *which* of the six post-filter RTs are forced
+opaque. There are six RT-creation sites in the setup routine at `exe+0x1de1a0..
+0x1de263`, in creation order: site 0 is the quarter-res 480×270 bloom-blur
+buffer, sites 1-5 are full-res 1920×1080 buffers. The bloom bright-pass reads
+site 1 (the scene copy, member slot `0x189c`) into the quarter buffer, so **bits
+0 and 1 must be opaque for bloom** — the default `0x03`. Bits 2-5 stay A8: one of
+those full-res buffers is the colour-grade target the dying/slow-mo black-and-
+white desaturation ramps through its **destination alpha**, and forcing it
+opaque makes the death grade degenerate and hangs the frame on D3DMetal. Setting
+the mask to `0x3f` (all six) restores that hang — do not. Each forced site logs
+a `PostFilterOpaqueRT: siteN slot 0xNNNN ...` line.
 
 ### Rain emission cap (`RainEmitCap`)
 
@@ -383,7 +404,7 @@ Install output: `scripts/HMCReducedX87.asi`; patch blob
 `scripts/HMCReducedX87.log`. Expected log line after launch:
 
 ```text
-[hitmancontracts.exe] applied: 1513/1513 hooks (0 skipped), blob 1033 KB at ... (delta ...)
+[hitmancontracts.exe] applied: 1514/1514 hooks (0 skipped), blob 1040 KB at ... (delta ...)
 ```
 
 A diagnostic build (`HMCReducedX87-diag.asi`, also built by `make`) adds a
@@ -391,6 +412,23 @@ NaN/Inf tripwire at float-returning translated functions and logs the FPU
 control word and helper-call counts. If a specific function misbehaves, exclude
 it by RVA: `python3 tools/translate.py --exclude 0x1234` (or list RVAs in
 `tools/exclusions/hitmancontracts.exe.txt`).
+
+### Seeding undiscovered entries (`starts/`)
+
+`HitmanContracts.exe` ships with its base-relocation table stripped, so
+`discover()`'s vtable/function-pointer net is dead: a C++ virtual method that is
+only reached through a vtable slot **and** whose prologue is not the standard
+`push ebp; mov ebp, esp` is never offered to the translator, and its x87 keeps
+running emulated. The rain particle vertex builder at `0x1d9a90` (a thiscall
+`sub esp,0x1c0` virtual, 433 x87 insns) is exactly this case and was the sole
+cause of the rain frame-time hit.
+
+Seed such entries by RVA in `tools/starts/hitmancontracts.exe.txt` (or
+`python3 tools/translate.py --include-start 0x1d9a90`). A seeded start is fed
+into discovery; the analyzer/codegen path is otherwise unchanged, and the range
+of any function that previously absorbed the seeded code (here `0x1d9a70`, a
+PRNG) shrinks to end at the new start automatically. Only add an RVA that is a
+real function entry — a wrong start would install a 5-byte entry hook mid-code.
 
 ## Plugin: Profiler (`HMCProfiler.asi`)
 

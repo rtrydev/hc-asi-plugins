@@ -89,6 +89,16 @@ static int g_rt_logs;               /* render-target creation log counter */
  * so they do not match this gate. */
 static int g_postfx_alpha_fix;
 static int g_postfx_opaque_rt;
+/* Which of the six post-filter RT-creation sites PostFilterOpaqueRT converts to
+ * X8R8G8B8 (bit i <-> g_postfx_rt_sites[i]). Default 0x03 = the quarter-res
+ * bloom-blur buffer (site 0) + the full-res scene copy the bloom bright-pass
+ * samples (site 1); those are the two the bright-pass multiplies by alpha and
+ * that go black on D3DMetal without opaque alpha. The remaining full-res buffers
+ * (sites 2-5) keep their A8 alpha — one of them is the colour-grade target the
+ * dying/slow-mo B&W desaturation ramps through its DESTINATION ALPHA, and
+ * forcing THAT one opaque makes the death grade degenerate and stalls the frame
+ * on D3DMetal. `PostFilterOpaqueRTMask` (decimal, 0..63) overrides the set. */
+static unsigned g_postfx_opaque_mask = 0x03;
 static IDirect3DSurface8 *g_backbuffer;
 static int g_rt_is_backbuffer = 1;
 static int g_stage0_is_rttex;
@@ -99,10 +109,27 @@ static DWORD g_srcblend = D3DBLEND_ONE;
 static unsigned int g_postfx_alpha_hits;
 static unsigned int g_postfx_probe_logs;
 
-static int is_postfilter_rt_caller(uint32_t rva)
+/* The six post-filter RT-creation call sites (return addresses), in creation
+ * order, with the RenderD3D post-object member slot each buffer lands in. Site 0
+ * is the quarter-res 480x270 bloom-blur buffer; sites 1-5 are full-res
+ * 1920x1080 buffers (scene copy / colour-grade / bloom source). */
+static const struct { uint32_t rva; uint32_t slot; } g_postfx_rt_sites[6] = {
+    { 0x1de1a0, 0x18ec },  /* 0: quarter-res 480x270 bloom-blur */
+    { 0x1de1c8, 0x189c },  /* 1: full-res */
+    { 0x1de1f0, 0x18a0 },  /* 2: full-res */
+    { 0x1de218, 0x18a4 },  /* 3: full-res */
+    { 0x1de23f, 0x18e8 },  /* 4: full-res */
+    { 0x1de263, 0x18f4 },  /* 5: full-res */
+};
+
+/* Return the site index (0..5) whose RT conversion is enabled by the mask for
+ * this caller, or -1 if this caller is not a converted post-filter site. */
+static int postfilter_rt_site(uint32_t rva)
 {
-    return rva == 0x1de1a0 || rva == 0x1de1c8 || rva == 0x1de1f0 ||
-           rva == 0x1de218 || rva == 0x1de23f || rva == 0x1de263;
+    for (int i = 0; i < 6; i++)
+        if (g_postfx_rt_sites[i].rva == rva)
+            return (g_postfx_opaque_mask & (1u << i)) ? i : -1;
+    return -1;
 }
 
 #define MAX_RT_TEX 64
@@ -337,11 +364,16 @@ static HRESULT WINAPI hook_CreateTexture(IDirect3DDevice8 *self, UINT W, UINT H,
     uint32_t rva = base ? (uint32_t)((uint8_t *)ret - base) : 0;
     D3DFORMAT requested_fmt = Fmt;
     if (g_postfx_opaque_rt && (Usage & D3DUSAGE_RENDERTARGET) &&
-        Fmt == D3DFMT_A8R8G8B8 && is_postfilter_rt_caller(rva)) {
-        Fmt = D3DFMT_X8R8G8B8;
-        if (g_rt_logs < 40)
-            logf_("PostFilterOpaqueRT: CreateTexture RT exe+0x%x %ux%u "
-                  "fmt %d -> %d", rva, W, H, requested_fmt, Fmt);
+        Fmt == D3DFMT_A8R8G8B8) {
+        int site = postfilter_rt_site(rva);
+        if (site >= 0) {
+            Fmt = D3DFMT_X8R8G8B8;
+            if (g_rt_logs < 40)
+                logf_("PostFilterOpaqueRT: site%d slot 0x%x CreateTexture RT "
+                      "exe+0x%x %ux%u fmt %d -> %d", site,
+                      g_postfx_rt_sites[site].slot, rva, W, H, requested_fmt,
+                      Fmt);
+        }
     }
     if ((Usage & D3DUSAGE_RENDERTARGET) && g_rt_logs < 40) {
         g_rt_logs++;
@@ -1248,8 +1280,15 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         int pfox_ini = read_int_ini("PostFilterOpaqueRT", 0);
         if (pfox_env || pfox_ini) {
             g_postfx_opaque_rt = 1;
-            logf_("PostFilterOpaqueRT ENABLED (%s)",
-                  pfox_ini ? "HMCWidescreen.ini" : "HMC_POSTFX_OPAQUE_RT=1");
+            /* Optional subset mask. Default 0x3f = all six sites (legacy). Set a
+             * value with the death-grade buffer's bit clear to keep bloom X8
+             * while the dying/slow-mo B&W desaturation keeps its A8 alpha. */
+            int mask_ini = read_int_ini("PostFilterOpaqueRTMask", -1);
+            if (mask_ini >= 0)
+                g_postfx_opaque_mask = (unsigned)mask_ini & 0x3f;
+            logf_("PostFilterOpaqueRT ENABLED (%s), site mask 0x%02x",
+                  pfox_ini ? "HMCWidescreen.ini" : "HMC_POSTFX_OPAQUE_RT=1",
+                  g_postfx_opaque_mask);
         }
         memset(v, 0, sizeof(v));
         int rain_env = GetEnvironmentVariableA("HMC_RAIN_EMIT_CAP", v,
