@@ -144,13 +144,37 @@ than by a byte patch.
 ### Fullscreen vs. borderless
 
 By default the game runs **borderless** — a frameless window filling the
-screen, aspect-preserving. This always creates, survives alt-tab, and needs
-no display mode switch. **Exclusive fullscreen** (`Fullscreen=1`) is
-**real-Windows only** (and only at an enumerated display mode); on
-Wine/CrossOver it is broken — winemac drives the captured display at a 2×
-Retina backing scale, so a fullscreen surface renders larger than the
-physical panel — and is treated as borderless-fullscreen, which fills the
-screen correctly.
+screen. This always creates, survives alt-tab, and needs no display mode
+switch. **Exclusive fullscreen** (`Fullscreen=1`) is **real-Windows only**
+(and only at an enumerated display mode); on Wine/CrossOver it is broken —
+winemac drives the captured display at a 2× Retina backing scale, so a
+fullscreen surface renders larger than the physical panel — and is treated as
+borderless-fullscreen, which fills the screen correctly.
+
+### Locked aspect ratio — `PreserveAspect` (default on)
+
+The backbuffer has the `HitmanContracts.ini` resolution's aspect, and when the
+screen's differs (a 16:9 `Resolution` on a MacBook's ~16:10 panel, say),
+stretching it across a desktop-covering window distorts the image vertically.
+With `PreserveAspect=1` (the default) the game window is instead sized to the
+**largest centred rect of the backbuffer's aspect** that fits the screen, and
+a full-screen **black backdrop window** beneath it supplies the letterbox
+(top/bottom) or pillarbox (left/right) bars — nothing is cropped or
+stretched. Set `PreserveAspect=0` for the old stretch-to-fill behaviour, or
+set `Resolution` to your display's own resolution for a bar-free, pixel-exact
+fill.
+
+Two designs that do *not* work on this stack, for the record (both were tried
+here or in the H2SA sibling): presenting into a sub-rect of a full-screen
+window puts the Steam overlay's corner popups in the bar region, where the
+periodic black repaint fights them (continuous blinking); and any per-frame /
+per-tick backdrop refill or `SetWindowPos` re-slot flushes a full-screen
+winemac surface on the Cocoa main thread — where presents also run — causing
+a rhythmic in-game stutter. So the window is the image, the backdrop is
+painted only when its update region reports actual dirt, re-slotted only when
+it is not below the game window at all, and the fullscreen-*sized* backdrop
+keeps winemac's fullscreen treatment (hidden menu bar, raised level, display
+capture) engaged even though the game window no longer covers the screen.
 
 ### Frame-rate cap
 
