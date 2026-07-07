@@ -2,8 +2,8 @@
 
 ASI plugins and a bundled ASI loader for **Hitman: Contracts** on modern
 systems, especially CrossOver/Rosetta 2 on Apple Silicon Macs. It is the
-sibling of the [Hitman 2: Silent Assassin build](../h2sa-asi-plugins) and the
-[Hitman: Codename 47 build](../hc47-asi-plugins). Contracts runs on the same
+sibling of the [Hitman 2: Silent Assassin build](https://github.com/rtrydev/h2sa-asi-plugins) and the
+[Hitman: Codename 47 build](https://github.com/rtrydev/hc47-asi-plugins). Contracts runs on the same
 engine lineage as Hitman 2 and is likewise a **Direct3D 8** title, so the
 loader-and-hooks approach is shared.
 
