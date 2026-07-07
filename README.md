@@ -176,6 +176,30 @@ it is not below the game window at all, and the fullscreen-*sized* backdrop
 keeps winemac's fullscreen treatment (hidden menu bar, raised level, display
 capture) engaged even though the game window no longer covers the screen.
 
+### Modern in-game resolution list — `ModernModes` (default on)
+
+Contracts builds its video-options resolution list straight from the D3D8
+mode enumeration (`GetAdapterModeCount` / `EnumAdapterModes`, filtered to
+32-bit modes and deduped by size). Under CrossOver that enumeration returns
+winemac's **scaled Mac desktop modes** (1147×745, 1352×878, 1512×982, …) —
+nothing a game would normally run at — and on a Retina panel those logical
+"points" sizes also understate the device: a 1512×982 14" MacBook really
+drives 3024×1964 pixels.
+
+With `ModernModes=1` the loader serves the game a curated list instead: the
+16:9 and 16:10 resolutions games typically offer (1280×720 … 3840×2160),
+**limited to what the device supports** — capped at the largest real
+enumerated display mode, raised under Wine to 2× the logical desktop to
+undo the hidden Retina scale — plus the current `HitmanContracts.ini`
+resolution so the active setting stays selectable. Picking an entry in-game
+is honoured at the device reset (and the `Resolution` line is re-read on
+every device create/reset, so an edited ini takes effect on the next launch
+without fighting the boot-time value). The borderless/letterbox presenter
+handles any offered size on any screen; on real Windows the exclusive-
+fullscreen path still validates against real display modes and falls back to
+borderless for sizes the display cannot mode-switch to, so every entry is
+operational there too. `ModernModes=0` passes the real enumeration through.
+
 ### Frame-rate cap
 
 The engine advances its simulation from the measured frame time, so an

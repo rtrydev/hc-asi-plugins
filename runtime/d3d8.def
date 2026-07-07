@@ -9,3 +9,4 @@ EXPORTS
     ValidatePixelShader @4
     ValidateVertexShader @5
     HMC_RegisterD3D8Hooks
+    HMC_IsCuratedMode

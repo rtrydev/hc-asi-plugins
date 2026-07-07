@@ -37,6 +37,8 @@
 
 /* Confirmed IDirect3D8 / IDirect3DDevice8 vtable slot indices (fixed D3D8
  * COM ABI, verified against the mingw d3d8.h vtable structs). */
+#define IDX_D3D8_GETMODECOUNT   6
+#define IDX_D3D8_ENUMMODES      7
 #define IDX_D3D8_CREATEDEVICE   15
 #define IDX_DEV_RESET           14
 #define IDX_DEV_PRESENT         15
@@ -1127,6 +1129,190 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
     return hr;
 }
 
+/* ---- modern resolution list (ModernModes) ----------------------------
+ *
+ * Contracts builds its video-options resolution list straight from D3D8:
+ * GetAdapterModeCount + an EnumAdapterModes loop (exe+0x1e38ae..0x1e396d)
+ * filtered to D3DFMT_X8R8G8B8 and deduped by WxH — the menu then formats the
+ * surviving entries as "%dx%d". Under CrossOver that enumeration returns
+ * winemac's list of *scaled Mac desktop modes* (e.g. 1147x745, 1352x878,
+ * 1512x982 on a 14" MacBook), so the in-game toggle offers nothing a game
+ * would normally run at, and on a Retina panel the logical (points) sizes
+ * understate what the device can actually show — the panel is 2x the
+ * reported desktop. On Windows the raw list works but is noisy and mixes in
+ * legacy 4:3 modes.
+ *
+ * With ModernModes=1 (HMCWidescreen.ini, default on) the loader instead
+ * serves the game a curated list: the 16:9 and 16:10 resolutions games
+ * typically offer, limited to what the device supports — capped at the
+ * largest real enumerated display mode, raised under Wine to 2x the logical
+ * desktop (the Retina backing scale winemac hides), and always including the
+ * current HitmanContracts.ini resolution so the active setting stays
+ * selectable. The borderless/letterbox presenter handles any of these sizes
+ * on any screen; on real Windows the exclusive-fullscreen path still
+ * validates against real modes (is_display_mode) and falls back to
+ * borderless for sizes the display cannot mode-switch to, so every offered
+ * entry is operational there too. Selecting an entry the engine already
+ * knows end-to-end (it lands in its own mode array) also spares us its
+ * unknown-resolution snap quirks. */
+static void *g_orig_modecount;
+static void *g_orig_enummodes;
+static int g_modern_modes = 1;      /* ModernModes ini toggle */
+static D3DDISPLAYMODE g_curated[24];
+static int g_n_curated = -1;        /* -1 not built yet; 0 = passthrough */
+
+static const struct { unsigned short w, h; } k_modern[] = {
+    {1280, 720}, {1280, 800}, {1366, 768}, {1440, 900}, {1600, 900},
+    {1680, 1050}, {1920, 1080}, {1920, 1200}, {2560, 1440}, {2560, 1600},
+    {3840, 2160},
+};
+
+static int is_wine_host(void)
+{
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                          "wine_get_version") != NULL;
+}
+
+/* Parse "Resolution WxH" from HitmanContracts.ini in the game root (this
+ * module's directory), mirroring the widescreen plugin's reader. */
+static void read_game_ini_resolution(int *w, int *h)
+{
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\HitmanContracts.ini", g_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (_strnicmp(p, "Resolution", 10) != 0) continue;
+        int rw = 0, rh = 0;
+        if (sscanf(p + 10, " %dx%d", &rw, &rh) == 2 &&
+            rw >= 320 && rh >= 200 && rw <= 16384 && rh <= 16384) {
+            *w = rw; *h = rh;
+        }
+        break;
+    }
+    fclose(f);
+}
+
+static void build_curated_modes(void)
+{
+    if (g_n_curated >= 0) return;
+    g_n_curated = 0;                /* passthrough unless built below */
+    if (!g_modern_modes) return;
+
+    /* Device capability cap. The largest real enumerated mode is the native
+     * resolution on Windows. Under Wine/winemac the enumeration is in Mac
+     * "points" and understates a Retina panel by the 2x backing scale, so
+     * raise the cap to 2x the logical desktop as well (a 1512x982 14" MacBook
+     * really drives 3024x1964 pixels). */
+    int dw = GetSystemMetrics(SM_CXSCREEN);
+    int dh = GetSystemMetrics(SM_CYSCREEN);
+    int capw = 0, caph = 0;
+    DEVMODEA dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; EnumDisplaySettingsA(NULL, i, &dm); i++) {
+        if (dm.dmBitsPerPel < 32) continue;
+        if ((int)dm.dmPelsWidth > capw) capw = (int)dm.dmPelsWidth;
+        if ((int)dm.dmPelsHeight > caph) caph = (int)dm.dmPelsHeight;
+    }
+    if (is_wine_host()) {
+        if (2 * dw > capw) capw = 2 * dw;
+        if (2 * dh > caph) caph = 2 * dh;
+    }
+    if (capw <= 0 || caph <= 0) { capw = dw; caph = dh; }
+    if (capw <= 0 || caph <= 0) {
+        logf_("ModernModes: no usable display metrics — passing the real "
+              "mode list through");
+        return;
+    }
+
+    int n = 0;
+    for (unsigned i = 0; i < sizeof(k_modern) / sizeof(k_modern[0]); i++) {
+        if (k_modern[i].w > capw || k_modern[i].h > caph) continue;
+        g_curated[n].Width = k_modern[i].w;
+        g_curated[n].Height = k_modern[i].h;
+        g_curated[n].RefreshRate = 0;          /* engine ignores it */
+        g_curated[n].Format = D3DFMT_X8R8G8B8; /* the engine's filter */
+        n++;
+    }
+    /* Keep the active setting selectable even if it is non-standard. */
+    int iw = 0, ih = 0;
+    read_game_ini_resolution(&iw, &ih);
+    if (iw && ih && iw <= capw && ih <= caph &&
+        n < (int)(sizeof(g_curated) / sizeof(g_curated[0]))) {
+        int dup = 0;
+        for (int i = 0; i < n; i++)
+            if ((int)g_curated[i].Width == iw &&
+                (int)g_curated[i].Height == ih) { dup = 1; break; }
+        if (!dup) {
+            g_curated[n].Width = (UINT)iw;
+            g_curated[n].Height = (UINT)ih;
+            g_curated[n].RefreshRate = 0;
+            g_curated[n].Format = D3DFMT_X8R8G8B8;
+            n++;
+        }
+    }
+    if (n == 0) {
+        logf_("ModernModes: no candidate fits the %dx%d cap — passing the "
+              "real mode list through", capw, caph);
+        return;
+    }
+
+    /* Sentinel: duplicate the last mode with a different refresh rate. The
+     * game's list builder (exe+0x1e38ae) allocates GetAdapterModeCount()*16
+     * bytes, stores one 16-byte entry per SURVIVING mode (X8R8G8B8 filter +
+     * adjacent same-WxH dedup), then writes a 16-byte zero TERMINATOR at the
+     * survivor count (exe+0x1e398f). Real enumerations always lose entries
+     * to that filtering (refresh-rate duplicates, 16-bit modes), so the
+     * terminator lands inside the allocation — but a fully-unique all-X8
+     * curated list made survivors == count, and the terminator overflowed
+     * the block by 16 bytes, corrupting the engine's pool allocator (int3
+     * assert in its block finder at exe+0x216927 shortly after startup).
+     * One adjacent duplicate gets deduped, keeping survivors == count-1 and
+     * the terminator in bounds, and is indistinguishable from what real
+     * drivers return anyway. */
+    g_curated[n] = g_curated[n - 1];
+    g_curated[n].RefreshRate = 60;
+    n++;
+    g_n_curated = n;
+
+    char list[512];
+    size_t off = 0;
+    for (int i = 0; i < n && off < sizeof(list) - 16; i++)
+        off += (size_t)snprintf(list + off, sizeof(list) - off, "%s%ux%u",
+                                i ? " " : "", g_curated[i].Width,
+                                g_curated[i].Height);
+    logf_("ModernModes: serving %d modes (cap %dx%d, desktop %dx%d%s): %s",
+          n, capw, caph, dw, dh, is_wine_host() ? ", wine 2x rule" : "", list);
+}
+
+static UINT WINAPI hook_GetAdapterModeCount(IDirect3D8 *self, UINT adapter)
+{
+    typedef UINT (WINAPI *mc_t)(IDirect3D8 *, UINT);
+    build_curated_modes();
+    if (g_n_curated > 0)
+        return (UINT)g_n_curated;
+    return ((mc_t)g_orig_modecount)(self, adapter);
+}
+
+static HRESULT WINAPI hook_EnumAdapterModes(IDirect3D8 *self, UINT adapter,
+    UINT idx, D3DDISPLAYMODE *mode)
+{
+    typedef HRESULT (WINAPI *em_t)(IDirect3D8 *, UINT, UINT,
+                                   D3DDISPLAYMODE *);
+    build_curated_modes();
+    if (g_n_curated > 0) {
+        if (!mode || idx >= (UINT)g_n_curated)
+            return D3DERR_INVALIDCALL;
+        *mode = g_curated[idx];
+        return D3D_OK;
+    }
+    return ((em_t)g_orig_enummodes)(self, adapter, idx, mode);
+}
+
 /* ---- exports --------------------------------------------------------- */
 
 __declspec(dllexport) IDirect3D8 * WINAPI Direct3DCreate8(UINT SDKVersion)
@@ -1138,12 +1324,30 @@ __declspec(dllexport) IDirect3D8 * WINAPI Direct3DCreate8(UINT SDKVersion)
     if (d3d) {
         patch_slot(d3d, IDX_D3D8_CREATEDEVICE, (void *)hook_CreateDevice,
                    &g_orig_createdevice);
-        logf_("Direct3DCreate8(%u) -> %p; CreateDevice wrapped", SDKVersion,
-              d3d);
+        patch_slot(d3d, IDX_D3D8_GETMODECOUNT,
+                   (void *)hook_GetAdapterModeCount, &g_orig_modecount);
+        patch_slot(d3d, IDX_D3D8_ENUMMODES, (void *)hook_EnumAdapterModes,
+                   &g_orig_enummodes);
+        logf_("Direct3DCreate8(%u) -> %p; CreateDevice + mode enumeration "
+              "wrapped", SDKVersion, d3d);
     } else {
         logf_("real Direct3DCreate8 returned NULL");
     }
     return d3d;
+}
+
+/* Is w x h one of the modes ModernModes offered the game's resolution menu?
+ * Used by the widescreen plugin to recognise (and honour) an in-game
+ * resolution switch at device Reset. Returns 0 when ModernModes is off or
+ * passing through, so callers keep their legacy behaviour. */
+__declspec(dllexport) int WINAPI HMC_IsCuratedMode(unsigned int w,
+                                                   unsigned int h)
+{
+    build_curated_modes();
+    for (int i = 0; i < g_n_curated; i++)
+        if (g_curated[i].Width == w && g_curated[i].Height == h)
+            return 1;
+    return 0;
 }
 
 /* The remaining four exports are forwarded verbatim; the game never calls
@@ -1274,6 +1478,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
                   (pfx_file ? "scripts/POSTFX_ALPHA_FIX marker" :
                    "HMC_POSTFX_ALPHA_FIX=1"));
         }
+        /* Modern in-game resolution list. Follows the widescreen plugin's
+         * master Enabled switch: with the plugin off the game runs its stock
+         * path and gets the real enumeration. */
+        g_modern_modes = read_int_ini("Enabled", 1) &&
+                         read_int_ini("ModernModes", 1);
+        logf_("ModernModes %s (curated 16:9/16:10 in-game resolution list)",
+              g_modern_modes ? "ENABLED" : "disabled");
         memset(v, 0, sizeof(v));
         int pfox_env = GetEnvironmentVariableA("HMC_POSTFX_OPAQUE_RT", v,
                                                sizeof(v)) && v[0] == '1';

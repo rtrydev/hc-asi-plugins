@@ -40,7 +40,7 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # Widescreen + startup fix plugin
 cp "$HERE/dist/HMCWidescreen.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/HMCWidescreen.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n' \
         > "$GAME/scripts/HMCWidescreen.ini"
 fi
 

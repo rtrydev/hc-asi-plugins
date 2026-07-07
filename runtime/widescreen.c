@@ -50,6 +50,12 @@
  *                   ; aspect — the window becomes the largest centred rect of
  *                   ; that aspect and a black backdrop window fills the rest
  *                   ; of the screen (letterbox); 0 = stretch to fill
+ *   ModernModes=1   ; serve the in-game resolution menu a curated 16:9/16:10
+ *                   ; list capped to what the device supports (the loader
+ *                   ; hooks the D3D8 mode enumeration; under winemac the raw
+ *                   ; list is scaled Mac desktop modes, useless for games);
+ *                   ; an in-game switch to a curated mode is honoured at
+ *                   ; device Reset; 0 = the real enumeration passes through
  *   CursorFix=0     ; hide the host (Mac) cursor over the game: 0 off
  *                   ; (default — see note), 1 on, -1 auto (on under Wine)
  *   FpsCap=60       ; frame-rate cap (the engine is frame-time bound and
@@ -231,6 +237,23 @@ static int is_wine(void)
 {
     return GetProcAddress(GetModuleHandleA("ntdll.dll"),
                           "wine_get_version") != NULL;
+}
+
+/* Is w x h one of the modes the loader's ModernModes offered the game's
+ * resolution menu? Resolved lazily from the d3d8 loader; absent (older
+ * loader, ModernModes off) means "no", keeping the legacy hard pin. */
+static int is_curated_mode(unsigned int w, unsigned int h)
+{
+    typedef int (WINAPI *fn_t)(unsigned int, unsigned int);
+    static fn_t fn;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        HMODULE ld = GetModuleHandleA("d3d8.dll");
+        if (ld)
+            fn = (fn_t)(uintptr_t)GetProcAddress(ld, "HMC_IsCuratedMode");
+    }
+    return fn ? fn(w, h) : 0;
 }
 
 /* Hitman 2's RenderD3D snaps the requested resolution to a fixed 4:3 ladder
@@ -1472,10 +1495,35 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
      * replaces whatever RenderD3D's fullscreen mode-selection produced —
      * which for a resolution not in its mode ladder is a stale mode or an
      * uninitialised, garbage height. The projection FOV fixup below makes
-     * any aspect correct. */
+     * any aspect correct.
+     *
+     * Two refinements for the in-game resolution toggle (which the loader's
+     * ModernModes feeds a curated 16:9/16:10 list):
+     *  - the ini is RE-READ here, so a Resolution line the game (or the user)
+     *    rewrote after startup takes effect on the next device create/reset
+     *    instead of being clobbered by the boot-time value;
+     *  - a RESET whose requested size differs from the ini but exactly
+     *    matches a curated menu mode is the user switching resolution
+     *    in-game — honour it and track it as current. Anything else (stale
+     *    snap output, garbage heights) still gets pinned. CreateDevice keeps
+     *    the hard pin: at boot the engine's request is derived from its own
+     *    mode selection, not from a live user choice. */
+    read_game_resolution();
     if (g_ini_w && g_ini_h) {
-        pp->BackBufferWidth = (UINT)g_ini_w;
-        pp->BackBufferHeight = (UINT)g_ini_h;
+        if (is_reset &&
+            pp->BackBufferWidth && pp->BackBufferHeight &&
+            (pp->BackBufferWidth != (UINT)g_ini_w ||
+             pp->BackBufferHeight != (UINT)g_ini_h) &&
+            is_curated_mode(pp->BackBufferWidth, pp->BackBufferHeight)) {
+            logf_("in-game resolution switch: %ux%u (was %dx%d) — honouring "
+                  "the reset request", pp->BackBufferWidth,
+                  pp->BackBufferHeight, g_ini_w, g_ini_h);
+            g_ini_w = (int)pp->BackBufferWidth;
+            g_ini_h = (int)pp->BackBufferHeight;
+        } else {
+            pp->BackBufferWidth = (UINT)g_ini_w;
+            pp->BackBufferHeight = (UINT)g_ini_h;
+        }
     }
 
     /* Exclusive fullscreen — REAL WINDOWS ONLY. It needs the requested
