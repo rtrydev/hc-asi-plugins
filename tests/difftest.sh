@@ -24,7 +24,7 @@ WINE="${WINE:-/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/w
 export CX_BOTTLE="${CX_BOTTLE:-Steam}"
 export WINEDEBUG=-all
 
-GAME="${HMC_GAME_DIR:-/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Contracts}"
+GAME="${HMC_GAME_DIR:-$HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Contracts}"
 GAME_WIN='C:\Program Files (x86)\Steam\steamapps\common\Hitman Contracts'
 
 [ -f "$ROOT/dist/HitmanContracts.exe.x87" ] || { echo "run tools/translate.py first"; exit 1; }

@@ -12,8 +12,8 @@ from x87 import analysis, x87
 GAME = os.environ.get("HMC_GAME_DIR") or (
     "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Hitman Contracts"
     if os.name == "nt" else
-    "/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/"
-    "drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Contracts")
+    os.path.expanduser("~/Library/Application Support/CrossOver/Bottles/Steam/"
+    "drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Contracts"))
 
 
 def census(mod):
