@@ -1608,12 +1608,24 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
      * Fix: request IMMEDIATE present (no vsync) so the software frame limiter
      * is the SOLE pacer — one clock, no beat, smooth 60. VSync=1 forces vsync
      * back on (INTERVAL_ONE); VSync=-1 auto and VSync=0 both use IMMEDIATE
-     * here. IMMEDIATE is in the device caps (0x…0001 always includes it) so
-     * CreateDevice accepts it; the loader also has a windowed retry/fallback
-     * if any driver refuses. The FpsCap limiter still bounds the rate, so
-     * "immediate" does not mean uncapped. */
-    pp->FullScreen_PresentationInterval =
-        (g_vsync == 1) ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+     * here. The FpsCap limiter still bounds the rate, so "immediate" does not
+     * mean uncapped.
+     *
+     * WINE-ONLY. Native D3D8 (unlike wined3d, and unlike D3D9) requires
+     * FullScreen_PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT for a
+     * WINDOWED swapchain and rejects everything else — IMMEDIATE and even
+     * INTERVAL_ONE — with D3DERR_INVALIDCALL (observed 0x8876086c from
+     * CreateDevice at startup on real Windows; the loader's safe fallback
+     * rescued that, but the same invalid interval made every in-game
+     * resolution-switch Reset fail, pushing the engine into its device
+     * teardown-and-recreate path). So on real Windows the windowed device
+     * always uses DEFAULT; the limiter's calibration then detects whether the
+     * present is vsync-paced and stands down by itself. */
+    if (is_wine())
+        pp->FullScreen_PresentationInterval = (g_vsync == 1)
+            ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+    else
+        pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
     if (pp->SwapEffect == D3DSWAPEFFECT_FLIP)
         pp->SwapEffect = D3DSWAPEFFECT_DISCARD;  /* FLIP is fullscreen-only */
 

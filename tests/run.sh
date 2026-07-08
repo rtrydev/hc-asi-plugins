@@ -17,7 +17,10 @@ STAGE=/tmp/h2test
 rm -rf "$STAGE"; mkdir -p "$STAGE/scripts"
 cp "$ROOT/dist/d3d8.dll" "$STAGE/"
 cp "$ROOT/dist/HMCWidescreen.asi" "$STAGE/scripts/"
-printf '[Widescreen]\nEnabled=1\nBorderless=1\nFOVCorrect=1\nFOVFactor=1.0\n' \
+# PostFilterAlphaFix=1 arms the loader's backbuffer capture so the harness's
+# Reset + device-recreation steps exercise its lifetime handling (the
+# native-Windows resolution-switch crash path) on this stack too.
+printf '[Widescreen]\nEnabled=1\nBorderless=1\nFOVCorrect=1\nFOVFactor=1.0\nPostFilterAlphaFix=1\n' \
     > "$STAGE/scripts/HMCWidescreen.ini"
 cp "$HERE/harness.exe" "$STAGE/"
 

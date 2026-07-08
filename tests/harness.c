@@ -70,6 +70,42 @@ int main(int argc, char **argv){
         got._11, pp.BackBufferWidth, pp.BackBufferHeight,
         (double)pp.BackBufferWidth/pp.BackBufferHeight);
 
+    /* In-game resolution switch, part 1: Reset to a new backbuffer size (what
+     * the engine does when a new mode is picked in the video options). On
+     * native D3D8 this is where two historical bugs met: a non-DEFAULT
+     * windowed presentation interval fails the Reset with INVALIDCALL, and a
+     * loader-held backbuffer reference fails it as an outstanding swapchain
+     * ref. */
+    D3DPRESENT_PARAMETERS pp2 = pp;
+    pp2.BackBufferWidth = 1280; pp2.BackBufferHeight = 720;
+    hr = dev->lpVtbl->Reset(dev, &pp2);
+    printf("Reset(1280x720) hr=0x%08lx (after fixup: %ux%u windowed=%d "
+           "interval=0x%lx)\n", (unsigned long)hr,
+           pp2.BackBufferWidth, pp2.BackBufferHeight, pp2.Windowed,
+           (unsigned long)pp2.FullScreen_PresentationInterval);
+    int reset_ok = SUCCEEDED(hr);
+
+    /* Part 2: full device teardown + recreation (the engine's fallback when
+     * Reset fails, and a settings-change path in its own right). With the
+     * old loader this Released a dangling backbuffer pointer inside
+     * capture_backbuffer and crashed (the native-Windows resolution-switch
+     * crash); it must survive and create cleanly. */
+    dev->lpVtbl->Release(dev); dev = NULL;
+    D3DPRESENT_PARAMETERS pp3; ZeroMemory(&pp3, sizeof(pp3));
+    pp3.BackBufferWidth = 1920; pp3.BackBufferHeight = 1080;
+    pp3.BackBufferFormat = D3DFMT_X8R8G8B8; pp3.BackBufferCount = 1;
+    pp3.SwapEffect = D3DSWAPEFFECT_DISCARD; pp3.hDeviceWindow = wnd;
+    pp3.Windowed = FALSE; pp3.EnableAutoDepthStencil = TRUE;
+    pp3.AutoDepthStencilFormat = D3DFMT_D16;
+    pp3.FullScreen_RefreshRateInHz = D3DPRESENT_RATE_DEFAULT;
+    hr = d3d->lpVtbl->CreateDevice(d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL,
+        wnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp3, &dev);
+    printf("re-CreateDevice hr=0x%08lx dev=%p (after fixup: %ux%u windowed=%d)\n",
+        (unsigned long)hr, (void*)dev,
+        pp3.BackBufferWidth, pp3.BackBufferHeight, pp3.Windowed);
+    if(FAILED(hr)||!dev){ printf("RESULT: re-CreateDevice FAILED\n"); return 1; }
+    if(!reset_ok){ printf("RESULT: Reset FAILED\n"); return 1; }
+
     printf("RESULT: OK\n");
     dev->lpVtbl->Release(dev);
     d3d->lpVtbl->Release(d3d);

@@ -257,18 +257,41 @@ static RTTex *find_rt_texture(IDirect3DBaseTexture8 *tex)
     return NULL;
 }
 
+/* Remember the device's backbuffer surface for POINTER IDENTITY only (the
+ * SetRenderTarget hook compares against it). The GetBackBuffer reference is
+ * released immediately: holding it across a Reset makes native D3D8 fail the
+ * Reset (outstanding swapchain reference), and when the game then tears the
+ * device down and recreates it, the runtime frees the surface regardless of
+ * that reference — so the old deferred Release here called through a dangling
+ * vtable pointer (the in-game resolution-switch crash on real Windows; the
+ * Wine/CrossOver stack tolerated both). The device keeps its own reference
+ * for as long as it lives, and the pointer is re-captured at every
+ * CreateDevice and successful Reset, so identity comparisons stay valid. */
 static void capture_backbuffer(IDirect3DDevice8 *dev)
 {
     typedef HRESULT (WINAPI *gb_t)(IDirect3DDevice8 *, UINT,
         D3DBACKBUFFER_TYPE, IDirect3DSurface8 **);
-    if (g_backbuffer) {
-        release_iunknown(g_backbuffer);
-        g_backbuffer = NULL;
-    }
+    IDirect3DSurface8 *bb = NULL;
     if (dev)
-        ((gb_t)(*(void ***)dev)[16])(dev, 0, D3DBACKBUFFER_TYPE_MONO,
-                                     &g_backbuffer);
+        ((gb_t)(*(void ***)dev)[16])(dev, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+    if (bb)
+        release_iunknown(bb);
+    g_backbuffer = bb;
     g_rt_is_backbuffer = 1;
+}
+
+/* Drop every cached object pointer of the current device generation. A Reset
+ * or a device recreation frees the old swapchain and the game's default-pool
+ * render-target textures, so a stale cached pointer that happens to equal a
+ * new allocation would misclassify draws (or, worse, be dereferenced). */
+static void forget_device_objects(void)
+{
+    g_backbuffer = NULL;
+    g_rt_is_backbuffer = 1;
+    g_n_rt_tex = 0;
+    g_stage0_is_rttex = 0;
+    g_stage0_rt_w = g_stage0_rt_h = 0;
+    g_stage0_rt_fmt = 0;
 }
 
 static int read_postfx_alpha_ini(void)
@@ -1005,7 +1028,23 @@ static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
             if (g_hooks[i].fix_present)
                 g_hooks[i].fix_present(pp, NULL, 1);
     if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
+    /* The old swapchain (and the game's default-pool textures) die in the
+     * Reset whether or not it succeeds — forget them before forwarding. */
+    forget_device_objects();
     HRESULT hr = ((rs_t)g_orig_reset)(self, pp);
+    /* Native D3D8 rejects any non-DEFAULT presentation interval on a WINDOWED
+     * swapchain with D3DERR_INVALIDCALL (CreateDevice has the same rule and
+     * its own fallback below). A plugin-chosen interval must not leave the
+     * in-game resolution switch on a dead Reset, which would push the engine
+     * into its teardown-and-recreate fallback. */
+    if (FAILED(hr) && pp && pp->Windowed &&
+        pp->FullScreen_PresentationInterval != D3DPRESENT_INTERVAL_DEFAULT) {
+        logf_("windowed Reset failed 0x%08lx — retrying with INTERVAL_DEFAULT",
+              (unsigned long)hr);
+        pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
+        hr = ((rs_t)g_orig_reset)(self, pp);
+        logf_("windowed-default Reset retry -> 0x%08lx", (unsigned long)hr);
+    }
     if (SUCCEEDED(hr) && g_postfx_alpha_fix)
         capture_backbuffer(self);
     return hr;
@@ -1077,6 +1116,10 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface &&
         *ppReturnedDeviceInterface) {
         if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
+        /* On a device RECREATION (the engine's fallback when a Reset fails,
+         * and its normal path for some settings changes) everything cached
+         * from the old device is dangling — never touch it, just forget it. */
+        forget_device_objects();
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_RESET,
                    (void *)hook_Reset, &g_orig_reset);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_PRESENT,
