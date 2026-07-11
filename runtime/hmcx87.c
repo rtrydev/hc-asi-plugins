@@ -1,7 +1,7 @@
 /* HMC Reduced-Precision x87 — runtime patch loader (32-bit ASI).
  *
  * Loads .x87 patch files (produced by tools/translate.py) from the
- * "<asi dir>/HMCReducedX87/" directory. When the matching game module is
+ * "<asi dir>/hmc_reduced_x87/" directory. When the matching game module is
  * loaded, allocates the translated SSE2 code, applies fixups and installs
  * a 5-byte jmp hook at every translated function entry.
  *
@@ -438,7 +438,7 @@ static void init(HMODULE self)
     if (sl) *sl = 0;
 
     char logpath[MAX_PATH];
-    snprintf(logpath, sizeof(logpath), "%s\\HMCReducedX87.log", g_dir);
+    snprintf(logpath, sizeof(logpath), "%s\\hmc_reduced_x87.log", g_dir);
     g_log = fopen(logpath, "w");
     logf_("HMC Reduced-Precision x87 loaded");
 
@@ -451,14 +451,14 @@ static void init(HMODULE self)
 
     /* enumerate patch files */
     char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%s\\HMCReducedX87\\*.x87", g_dir);
+    snprintf(pat, sizeof(pat), "%s\\hmc_reduced_x87\\*.x87", g_dir);
     WIN32_FIND_DATAA fd;
     HANDLE fh = FindFirstFileA(pat, &fd);
     if (fh != INVALID_HANDLE_VALUE) {
         do {
             if (g_n_pending >= MAX_PATCHES) break;
             Pending *p = &g_pending[g_n_pending];
-            snprintf(p->path, sizeof(p->path), "%s\\HMCReducedX87\\%s",
+            snprintf(p->path, sizeof(p->path), "%s\\hmc_reduced_x87\\%s",
                      g_dir, fd.cFileName);
             /* module name = header field */
             FILE *f = fopen(p->path, "rb");
@@ -477,7 +477,7 @@ static void init(HMODULE self)
         FindClose(fh);
     }
     if (!g_n_pending) {
-        logf_("no patch files found in %s\\HMCReducedX87", g_dir);
+        logf_("no patch files found in %s\\hmc_reduced_x87", g_dir);
         return;
     }
 

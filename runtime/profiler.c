@@ -1,9 +1,10 @@
-/* HMCProfiler.asi — on-screen performance overlay (top-right corner).
+/* Profiler — on-screen performance overlay (top-right corner), shipped as
+ * part of hmc_display.asi (entry point: display_main.c).
  *
  * Shows, once per frame:
  *   - FPS and frame time (rolling average / peak over a ~0.5s window);
  *   - a CPU-time breakdown from an EIP-sampling thread, split into
- *       X87  = the SSE2-translated blob (HMCReducedX87)
+ *       X87  = the SSE2-translated blob (hmc_reduced_x87)
  *       GAME = HitmanContracts.exe (untranslated code: renderer + game
  *              logic + any leftover x87 the translator did not take)
  *       REST = everything else (D3D/Metal, wine, system)
@@ -31,22 +32,19 @@
 #include <stdarg.h>
 #include <string.h>
 #include "hmc_d3d8.h"
+#include "hmc_plugin.h"
 
 /* ------------------------------------------------------------------ */
 /* logging                                                            */
 /* ------------------------------------------------------------------ */
-static FILE *g_log;
 static char g_dir[MAX_PATH];
 
 static void logf_(const char *fmt, ...)
 {
-    if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    hmc_vlogf("profiler", fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
 }
 
 /* ------------------------------------------------------------------ */
@@ -63,22 +61,17 @@ static FILETIME g_ini_mtime;
 static void load_config(void)
 {
     FILE *f = fopen(g_ini, "r");
-    if (!f) {
-        f = fopen(g_ini, "w");
-        if (f) {
-            fputs("[Profiler]\n"
-                  "Enabled=1\n"
-                  "Scale=1.0\n"
-                  "ShowCPU=1\n"
-                  "OffsetX=8\n"
-                  "OffsetY=8\n", f);
-            fclose(f);
-        }
-        return;
-    }
-    char line[128];
+    if (!f) return;
+    char line[128], sect[32];
+    int in_profiler = 0;   /* our keys live under [profiler] */
     while (fgets(line, sizeof(line), f)) {
         int b; float v;
+        if (sscanf(line, " [%31[^]]]", sect) == 1) {
+            in_profiler = !_stricmp(sect, "profiler");
+            continue;
+        }
+        if (!in_profiler)
+            continue;
         if (sscanf(line, " Enabled = %d", &b) == 1 ||
             sscanf(line, " Enabled=%d", &b) == 1) g_enabled = b;
         else if (sscanf(line, " ShowCPU = %d", &b) == 1 ||
@@ -127,7 +120,7 @@ static char     g_blob_module[32];
 static void load_blob_desc(void)
 {
     char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%s\\HMCReducedX87\\*.x87", g_dir);
+    snprintf(pat, sizeof(pat), "%s\\hmc_reduced_x87\\*.x87", g_dir);
     WIN32_FIND_DATAA fd;
     HANDLE fh = FindFirstFileA(pat, &fd);
     if (fh == INVALID_HANDLE_VALUE) {
@@ -135,7 +128,7 @@ static void load_blob_desc(void)
         return;
     }
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\HMCReducedX87\\%s", g_dir, fd.cFileName);
+    snprintf(path, sizeof(path), "%s\\hmc_reduced_x87\\%s", g_dir, fd.cFileName);
     FindClose(fh);
     FILE *f = fopen(path, "rb");
     if (!f) return;
@@ -174,7 +167,7 @@ static void module_range(const char *name, uint32_t *base, uint32_t *size)
 }
 
 /* The first translated function is emitted at blob_off 0, so the target of
- * the 5-byte jmp HMCReducedX87 installed at its entry IS the blob base. */
+ * the 5-byte jmp hmc_reduced_x87 installed at its entry IS the blob base. */
 static void locate_blob(void)
 {
     if (g_blob_base || !g_n_probe || !g_game_base) return;
@@ -344,7 +337,7 @@ static DWORD WINAPI sampler(LPVOID arg)
          * read its EIP. Under CrossOver that SuspendThread/GetThreadContext/
          * ResumeThread round-trip is not free, and at 250Hz it measurably
          * steals frame time from the very thread we are profiling (it showed up
-         * as ~8-15% "HMCProfiler.asi" in its own samples). So only sample when
+         * as ~8-15% "hmc_display.asi" in its own samples). So only sample when
          * the CPU breakdown is actually being shown; with ShowCPU=0 the overlay
          * still displays FPS/frame time (measured cheaply in on_frame, no thread
          * suspend), and this thread just idles. */
@@ -696,16 +689,13 @@ static const HMCD3D8Hooks g_hooks = {
 /* ------------------------------------------------------------------ */
 /* init                                                                */
 /* ------------------------------------------------------------------ */
-static void init(HMODULE self)
+void hmc_profiler_init(HINSTANCE self)
 {
     GetModuleFileNameA(self, g_dir, sizeof(g_dir));
     char *sl = strrchr(g_dir, '\\');
     if (sl) *sl = 0;
-    snprintf(g_ini, sizeof(g_ini), "%s\\HMCProfiler.ini", g_dir);
+    snprintf(g_ini, sizeof(g_ini), "%s\\hmc_display.ini", g_dir);
 
-    char logp[MAX_PATH];
-    snprintf(logp, sizeof(logp), "%s\\HMCProfiler.log", g_dir);
-    g_log = fopen(logp, "w");
     logf_("HMC Profiler loaded");
 
     load_config();
@@ -722,14 +712,7 @@ static void init(HMODULE self)
     else logf_("d3d8.dll loader / HMC_RegisterD3D8Hooks not found");
 }
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void hmc_profiler_detach(void)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        init((HMODULE)inst);
-    } else if (reason == DLL_PROCESS_DETACH) {
-        g_run = 0;
-    }
-    return TRUE;
+    g_run = 0;
 }

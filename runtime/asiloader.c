@@ -13,7 +13,7 @@
  *
  * On process attach it:
  *  - loads every *.asi from the scripts/ directory next to it, logging to
- *    scripts/HMCAsiLoader.log;
+ *    scripts/hmc_asi_loader.log;
  *  - exports all five real d3d8.dll entry points at their real ordinals
  *    (see d3d8.def) and forwards four of them to the system d3d8.dll,
  *    resolved lazily on first call;
@@ -142,7 +142,7 @@ static int g_n_rt_tex;
 /* ---- draw/lock diagnostic (HMC_DRAWSTATS=1) --------------------------
  * Opt-in per-frame instrumentation to settle whether a heavy scene (e.g.
  * rain) is CPU/dynamic-VB-lock bound or GPU/fill bound. Every window of
- * DRAWSTATS_WINDOW frames it logs, to HMCAsiLoader.log, the window's fps and
+ * DRAWSTATS_WINDOW frames it logs, to hmc_asi_loader.log, the window's fps and
  * per-frame draw count, VB-lock count (and the DISCARD subset), time spent
  * inside VB Lock, and time spent inside Present. The fps of each line is
  * self-correlating: rainy stretches show up as the low-fps lines, so a
@@ -294,15 +294,29 @@ static void forget_device_objects(void)
     g_stage0_rt_fmt = 0;
 }
 
+/* Both readers only look at the [display] section of hmc_display.ini (keys
+ * before any section header count too, and the pre-rename [Widescreen] header
+ * is accepted) — the same ini also carries a [profiler] section whose keys
+ * (e.g. its own "Enabled") must not be picked up here. */
+static int ini_section_line(const char *line, int *in_display)
+{
+    char sect[32];
+    if (sscanf(line, " [%31[^]]]", sect) != 1) return 0;
+    *in_display = !_stricmp(sect, "display") || !_stricmp(sect, "widescreen");
+    return 1;
+}
+
 static int read_postfx_alpha_ini(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\scripts\\HMCWidescreen.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\scripts\\hmc_display.ini", g_dir);
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char line[128];
-    int enabled = 0, b;
+    int enabled = 0, b, in_display = 1;
     while (fgets(line, sizeof(line), f)) {
+        if (ini_section_line(line, &in_display) || !in_display)
+            continue;
         if (sscanf(line, " PostFilterAlphaFix = %d", &b) == 1 ||
             sscanf(line, " PostFilterAlphaFix=%d", &b) == 1) {
             enabled = b != 0;
@@ -316,14 +330,16 @@ static int read_postfx_alpha_ini(void)
 static int read_int_ini(const char *name, int def)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\scripts\\HMCWidescreen.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\scripts\\hmc_display.ini", g_dir);
     FILE *f = fopen(path, "r");
     if (!f) return def;
     char line[128], lhs[64];
-    int value = def;
+    int value = def, in_display = 1;
     while (fgets(line, sizeof(line), f)) {
         int v;
         lhs[0] = 0;
+        if (ini_section_line(line, &in_display) || !in_display)
+            continue;
         if ((sscanf(line, " %63[^= ] = %d", lhs, &v) == 2 ||
              sscanf(line, " %63s %d", lhs, &v) == 2) &&
             _stricmp(lhs, name) == 0) {
@@ -1185,7 +1201,7 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
  * reported desktop. On Windows the raw list works but is noisy and mixes in
  * legacy 4:3 modes.
  *
- * With ModernModes=1 (HMCWidescreen.ini, default on) the loader instead
+ * With ModernModes=1 (hmc_display.ini, default on) the loader instead
  * serves the game a curated list: the 16:9 and 16:10 resolutions games
  * typically offer, limited to what the device supports — capped at the
  * largest real enumerated display mode, raised under Wine to 2x the logical
@@ -1484,7 +1500,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         char *sl = strrchr(g_dir, '\\');
         if (sl) *sl = 0;
         char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\scripts\\HMCAsiLoader.log",
+        snprintf(logpath, sizeof(logpath), "%s\\scripts\\hmc_asi_loader.log",
                  g_dir);
         g_log = fopen(logpath, "w");
         logf_("HMC ASI Loader (d3d8.dll proxy) attached");
@@ -1517,7 +1533,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (pfx_env || pfx_file || pfx_ini) {
             g_postfx_alpha_fix = 1;
             logf_("PostFilterAlphaFix ENABLED (%s)",
-                  pfx_ini ? "HMCWidescreen.ini" :
+                  pfx_ini ? "hmc_display.ini" :
                   (pfx_file ? "scripts/POSTFX_ALPHA_FIX marker" :
                    "HMC_POSTFX_ALPHA_FIX=1"));
         }
@@ -1541,7 +1557,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             if (mask_ini >= 0)
                 g_postfx_opaque_mask = (unsigned)mask_ini & 0x3f;
             logf_("PostFilterOpaqueRT ENABLED (%s), site mask 0x%02x",
-                  pfox_ini ? "HMCWidescreen.ini" : "HMC_POSTFX_OPAQUE_RT=1",
+                  pfox_ini ? "hmc_display.ini" : "HMC_POSTFX_OPAQUE_RT=1",
                   g_postfx_opaque_mask);
         }
         memset(v, 0, sizeof(v));
@@ -1553,7 +1569,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             if (g_rain_emit_cap < 16) g_rain_emit_cap = 16;
             if (g_rain_emit_cap > 4096) g_rain_emit_cap = 4096;
             logf_("RainEmitCap ENABLED (%s, cap=%d)",
-                  rain_env > 0 ? "HMC_RAIN_EMIT_CAP" : "HMCWidescreen.ini",
+                  rain_env > 0 ? "HMC_RAIN_EMIT_CAP" : "hmc_display.ini",
                   g_rain_emit_cap);
             arm_rain_emit_cap();
         }
@@ -1566,7 +1582,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             if (g_rain_system_cap < 4) g_rain_system_cap = 4;
             if (g_rain_system_cap > 256) g_rain_system_cap = 256;
             logf_("RainSystemCap ENABLED (%s, cap=%d)",
-                  rsys_env > 0 ? "HMC_RAIN_SYSTEM_CAP" : "HMCWidescreen.ini",
+                  rsys_env > 0 ? "HMC_RAIN_SYSTEM_CAP" : "hmc_display.ini",
                   g_rain_system_cap);
             arm_rain_system_cap();
         }

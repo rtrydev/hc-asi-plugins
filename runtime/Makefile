@@ -9,34 +9,32 @@ endif
 CFLAGS := -O2 -Wall -Wextra -msse2 -static-libgcc
 LDFLAGS := -shared -Wl,--kill-at -static -lkernel32
 
-.PHONY: all clean
+.PHONY: all diag clean
 
-all: ../dist/d3d8.dll ../dist/HMCWidescreen.asi \
-     ../dist/HMCReducedX87.asi ../dist/HMCReducedX87-diag.asi \
-     ../dist/HMCProfiler.asi
+all: ../dist/d3d8.dll ../dist/hmc_display.asi ../dist/hmc_reduced_x87.asi
+
+# diagnostic x87 build (helper NaN tracing); built on demand, not installed
+diag: ../dist/hmc_reduced_x87_diag.asi
 
 ../dist/d3d8.dll: asiloader.c d3d8.def hmc_d3d8.h
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ asiloader.c d3d8.def $(LDFLAGS) \
 	      -Wl,--enable-stdcall-fixup -luser32 -lgdi32
 
-../dist/HMCWidescreen.asi: widescreen.c hmc_d3d8.h
+../dist/hmc_display.asi: display_main.c widescreen.c profiler.c \
+                         hmc_d3d8.h hmc_plugin.h
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ widescreen.c $(LDFLAGS) -luser32 -lgdi32 -lwinmm
+	$(CC) $(CFLAGS) -o $@ display_main.c widescreen.c profiler.c \
+	      $(LDFLAGS) -luser32 -lgdi32 -lwinmm
 
-../dist/HMCReducedX87.asi: hmcx87.c helpers.S
+../dist/hmc_reduced_x87.asi: hmcx87.c helpers.S
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ hmcx87.c helpers.S $(LDFLAGS)
 
-../dist/HMCReducedX87-diag.asi: hmcx87.c helpers.S
+../dist/hmc_reduced_x87_diag.asi: hmcx87.c helpers.S
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -DHMC_DIAG -o $@ $^ $(LDFLAGS)
-
-../dist/HMCProfiler.asi: profiler.c hmc_d3d8.h
-	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ profiler.c $(LDFLAGS) -ld3d8
+	$(CC) $(CFLAGS) -DHMC_DIAG -o $@ hmcx87.c helpers.S $(LDFLAGS)
 
 clean:
-	rm -f ../dist/d3d8.dll ../dist/HMCWidescreen.asi \
-	      ../dist/HMCReducedX87.asi ../dist/HMCReducedX87-diag.asi \
-	      ../dist/HMCProfiler.asi
+	rm -f ../dist/d3d8.dll ../dist/hmc_display.asi \
+	      ../dist/hmc_reduced_x87.asi ../dist/hmc_reduced_x87_diag.asi

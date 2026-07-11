@@ -7,20 +7,20 @@ sibling of the [Hitman 2: Silent Assassin build](https://github.com/rtrydev/h2sa
 engine lineage as Hitman 2 and is likewise a **Direct3D 8** title, so the
 loader-and-hooks approach is shared.
 
-The repo builds four artifacts:
+The repo builds three artifacts:
 
 - `d3d8.dll` — a Direct3D 8 proxy that doubles as the ASI loader. It loads
   every `*.asi` from `scripts/`, forwards the real d3d8 exports to the system
   d3d8, and wraps the D3D8 COM interface so plugins can influence device
   creation and rendering without patching game code.
-- `HMCWidescreen.asi` — makes the game **start** under CrossOver (the stock
+- `hmc_display.asi` — makes the game **start** under CrossOver (the stock
   exclusive-fullscreen device fails there) and renders it in correct
   widescreen at any resolution. Also fixes the mouse and frame pacing under
-  CrossOver, and can run the post-filter effects at full resolution.
-- `HMCReducedX87.asi` — translates the game's x87 float code to SSE2 at
+  CrossOver, and can run the post-filter effects at full resolution. Bundles
+  the profiler: a top-right on-screen overlay showing FPS, frame time, and an
+  EIP-sampled CPU-time breakdown (see below).
+- `hmc_reduced_x87.asi` — translates the game's x87 float code to SSE2 at
   runtime for a large CrossOver/Rosetta 2 performance win (see below).
-- `HMCProfiler.asi` — a top-right on-screen overlay showing FPS, frame time,
-  and an EIP-sampled CPU-time breakdown (see below).
 
 The widescreen/startup fix hooks the fixed Direct3D 8 COM ABI, so it has **no
 game-build byte offsets** to break. The x87 plugin does patch game code, but
@@ -62,9 +62,9 @@ python3 tools/translate.py     # writes dist/HitmanContracts.exe.x87
 ./install.sh -u                # uninstall (leaves your plugin .ini files)
 ```
 
-The `translate.py` step is only for `HMCReducedX87.asi`; the loader,
-widescreen and profiler plugins build without it. `install.sh` installs the
-x87 plugin only if both `dist/HMCReducedX87.asi` and
+The `translate.py` step is only for `hmc_reduced_x87.asi`; the loader and the
+display plugin build without it. `install.sh` installs the
+x87 plugin only if both `dist/hmc_reduced_x87.asi` and
 `dist/HitmanContracts.exe.x87` exist.
 
 By default `install.sh` targets:
@@ -107,7 +107,7 @@ Launch the game the normal way (through the Steam client, appid `247430`),
 not by running `HitmanContracts.exe` directly, so the game's Steam check
 passes.
 
-## Plugin: Widescreen + startup fix (`HMCWidescreen.asi`)
+## Plugin: Display — widescreen + startup fix + profiler (`hmc_display.asi`)
 
 Two problems on a modern Mac, both handled at the D3D8 boundary:
 
@@ -303,10 +303,11 @@ and `RainSystemCap=N` limits how many visible rain systems are processed per
 frame. Both default to `0` (off); lower values are faster but can visibly
 thin dense rain — compare the same camera angle against `0`.
 
-Config: `scripts/HMCWidescreen.ini`
+Config: the `[display]` section of `scripts/hmc_display.ini` (the `[profiler]`
+section is described below)
 
 ```ini
-[Widescreen]
+[display]
 Enabled=1
 Fullscreen=0        ; 1 = exclusive fullscreen (real Windows only, at an
                     ; enumerated mode); on Wine/Mac -> borderless-fullscreen
@@ -332,10 +333,52 @@ MouseClipFix=-1     ; mouse-look edge-wall fix: -1 auto, 0 off, 1 on
 MouseMotionFix=-1   ; slow-move stall fix: -1 auto, 0 off, 1 on
 ```
 
-Install output: loader `d3d8.dll` (game root); `scripts/HMCWidescreen.asi` +
-`.ini`; logs `scripts/HMCAsiLoader.log`, `scripts/HMCWidescreen.log`.
+Install output: loader `d3d8.dll` (game root); `scripts/hmc_display.asi` +
+`.ini`; logs `scripts/hmc_asi_loader.log`, `scripts/hmc_display.log`.
 
-## Plugin: Reduced x87 (`HMCReducedX87.asi`)
+### Profiler overlay
+
+A small performance overlay in the top-right corner, drawn each frame through
+the loader's `on_frame` hook (a built-in pixel font rendered via
+`DrawPrimitiveUP` with full state save/restore — no game offsets). It shows:
+
+```text
+FPS 60
+MS 16.6/22.0        ; average / peak frame time this window
+X87 38%             ; CPU in the SSE2-translated blob
+GAME 45%            ; CPU in HitmanContracts.exe (untranslated: renderer +
+                    ; game logic + any leftover x87)
+REST 17%            ; everything else (D3D/Metal, wine, system)
+```
+
+The CPU split comes from a background thread that samples the game's main
+thread instruction pointer and buckets it by address range. It follows the
+`hmc_reduced_x87` entry hooks to find the translated blob, so blob samples are
+attributed to **X87** — making the x87 translation's effect directly visible
+(time that was emulated x87 now shows up as native SSE2 under X87, moving out
+of GAME). Because Contracts is monolithic there is no separate renderer
+module, so untranslated renderer code and game logic both fall under GAME.
+
+Config: the `[profiler]` section of `scripts/hmc_display.ini`
+
+```ini
+[profiler]
+Enabled=1      ; 0 hides the overlay (sampler still idle-cheap)
+Scale=1.0      ; text size; 2.0 doubles it
+ShowCPU=0      ; 0 = FPS + frame time only (default); 1 = add the
+               ; X87/GAME/REST breakdown. Sampling suspends the game's main
+               ; thread 250x/second and costs ~8-15% frame time — leave it
+               ; off for play, turn on only to diagnose.
+OffsetX=8      ; inset from the right edge, in pixels
+OffsetY=8      ; inset from the top edge, in pixels
+```
+
+The profiler's log lines (tagged `[profiler]` in `scripts/hmc_display.log`)
+are a periodic text snapshot of the same stats plus a `REST-top:` breakdown
+naming the modules the "REST" time lands in (e.g. `wined3d.dll`, `d3d8.dll`,
+`ntdll.dll`).
+
+## Plugin: Reduced x87 (`hmc_reduced_x87.asi`)
 
 Improves performance under CrossOver/Rosetta 2, where x87 instructions are
 emulated in software (80-bit) while SSE2 runs on hardware. An offline
@@ -364,7 +407,7 @@ Generate the patch blob and build the plugin:
 ```sh
 pip3 install capstone pefile
 python3 tools/translate.py            # writes dist/HitmanContracts.exe.x87
-(cd runtime && make)                  # builds dist/HMCReducedX87.asi
+(cd runtime && make)                  # builds dist/hmc_reduced_x87.asi
 ./install.sh                          # installs the .asi + the .x87 blob
 ```
 
@@ -373,15 +416,16 @@ size does not match the blob, it logs a mismatch and applies nothing. It also
 verifies each function's live entry bytes against the recorded originals
 before hooking, so an unexpected entry is skipped rather than mis-hooked.
 
-Install output: `scripts/HMCReducedX87.asi`; patch blob
-`scripts/HMCReducedX87/HitmanContracts.exe.x87`; log
-`scripts/HMCReducedX87.log`. Expected log line after launch:
+Install output: `scripts/hmc_reduced_x87.asi`; patch blob
+`scripts/hmc_reduced_x87/HitmanContracts.exe.x87`; log
+`scripts/hmc_reduced_x87.log`. Expected log line after launch:
 
 ```text
 [hitmancontracts.exe] applied: 1514/1514 hooks (0 skipped), blob 1040 KB at ... (delta ...)
 ```
 
-A diagnostic build (`HMCReducedX87-diag.asi`, also built by `make`) adds a
+A diagnostic build (`hmc_reduced_x87_diag.asi`, built on demand with
+`make diag`) adds a
 NaN/Inf tripwire at float-returning translated functions — useful if a
 translated function is suspected of misbehaving. If one does, exclude it by
 RVA: `python3 tools/translate.py --exclude 0x1234` (or list RVAs in
@@ -394,52 +438,10 @@ would otherwise use to find them). Such entries can be seeded by RVA in
 game's biggest remaining x87 hotspot, is included this way. Only add an RVA
 that is a real function entry.
 
-## Plugin: Profiler (`HMCProfiler.asi`)
-
-A small performance overlay in the top-right corner, drawn each frame through
-the loader's `on_frame` hook (a built-in pixel font rendered via
-`DrawPrimitiveUP` with full state save/restore — no game offsets). It shows:
-
-```text
-FPS 60
-MS 16.6/22.0        ; average / peak frame time this window
-X87 38%             ; CPU in the SSE2-translated blob
-GAME 45%            ; CPU in HitmanContracts.exe (untranslated: renderer +
-                    ; game logic + any leftover x87)
-REST 17%            ; everything else (D3D/Metal, wine, system)
-```
-
-The CPU split comes from a background thread that samples the game's main
-thread instruction pointer and buckets it by address range. It follows the
-`HMCReducedX87` entry hooks to find the translated blob, so blob samples are
-attributed to **X87** — making the x87 translation's effect directly visible
-(time that was emulated x87 now shows up as native SSE2 under X87, moving out
-of GAME). Because Contracts is monolithic there is no separate renderer
-module, so untranslated renderer code and game logic both fall under GAME.
-
-Config: `scripts/HMCProfiler.ini`
-
-```ini
-[Profiler]
-Enabled=1      ; 0 hides the overlay (sampler still idle-cheap)
-Scale=1.0      ; text size; 2.0 doubles it
-ShowCPU=0      ; 0 = FPS + frame time only (default); 1 = add the
-               ; X87/GAME/REST breakdown. Sampling suspends the game's main
-               ; thread 250x/second and costs ~8-15% frame time — leave it
-               ; off for play, turn on only to diagnose.
-OffsetX=8      ; inset from the right edge, in pixels
-OffsetY=8      ; inset from the top edge, in pixels
-```
-
-Install output: `scripts/HMCProfiler.asi` + `.ini`; log
-`scripts/HMCProfiler.log` — a periodic text snapshot of the same stats plus a
-`REST-top:` breakdown naming the modules the "REST" time lands in (e.g.
-`wined3d.dll`, `d3d8.dll`, `ntdll.dll`).
-
 ## ASI Loader (`d3d8.dll`)
 
 A minimal d3d8.dll proxy (`runtime/asiloader.c`). On attach it loads every
-`*.asi` from `scripts/` and logs to `scripts/HMCAsiLoader.log`. It exports
+`*.asi` from `scripts/` and logs to `scripts/hmc_asi_loader.log`. It exports
 all five real d3d8 entry points at their real ordinals (see
 `runtime/d3d8.def`); four are forwarded to the system d3d8, resolved lazily,
 and `Direct3DCreate8` is wrapped so the returned `IDirect3D8` — and the
@@ -462,15 +464,15 @@ the D3D8 hooks just registers through the same API.
 `Direct3DCreate8`, then `CreateDevice` with exclusive-fullscreen parameters —
 against the game-directory proxy, so the whole proxy → plugin → device path
 can be exercised without launching the game. For the real game, launch
-through Steam and inspect `scripts/HMCAsiLoader.log` and
-`scripts/HMCWidescreen.log`: they record the requested vs. applied
+through Steam and inspect `scripts/hmc_asi_loader.log` and
+`scripts/hmc_display.log`: they record the requested vs. applied
 presentation parameters and the `CreateDevice` result.
 
 ### Draw-cost probe
 
 For performance captures (e.g. rainy scenes), enable the loader's opt-in draw
 probe with `HMC_DRAWSTATS=1` or an empty `scripts/DRAWSTATS` marker file
-before launch. `scripts/HMCAsiLoader.log` then emits one line per 60-frame
+before launch. `scripts/hmc_asi_loader.log` then emits one line per 60-frame
 window with FPS, draw counts, vertex-buffer lock time, Present time and rain
 stats — enough to tell CPU submission cost apart from GPU/present cost when
 chasing a dip.

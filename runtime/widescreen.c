@@ -37,8 +37,8 @@
  * right "fullscreen" on this stack; there is nothing to gain from the
  * exclusive path here (the present cost is the same under D3DMetal).
  *
- * Config: scripts/HMCWidescreen.ini
- *   [Widescreen]
+ * Config: scripts/hmc_display.ini
+ *   [display]
  *   Enabled=1
  *   Fullscreen=0    ; 1 = exclusive fullscreen (real Windows only, at an
  *                   ; enumerated mode); on Wine/Mac -> borderless-fullscreen
@@ -80,12 +80,12 @@
 #include <mmsystem.h>
 #include <immintrin.h>          /* _mm_pause for the limiter spin */
 #include "hmc_d3d8.h"
+#include "hmc_plugin.h"
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  /* Win10 1803+ */
 #endif
 
-static FILE *g_log;
 static char g_dir[MAX_PATH];
 static int g_enabled = 1;
 static int g_borderless = -1;      /* -1 auto (Wine), 0 never, 1 always */
@@ -133,25 +133,31 @@ static volatile int g_kicks_left;    /* remaining startup activation kicks */
 
 static void logf_(const char *fmt, ...)
 {
-    if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    hmc_vlogf("widescreen", fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
 }
 
 static void read_config(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\HMCWidescreen.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\hmc_display.ini", g_dir);
     FILE *f = fopen(path, "r");
     if (!f) return;
-    char line[128];
+    char line[128], sect[32];
     int b;
     float v;
+    int in_display = 1;   /* keys before any section header count too */
     while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, " [%31[^]]]", sect) == 1) {
+            /* [Widescreen] accepted for pre-rename inis */
+            in_display = !_stricmp(sect, "display") ||
+                         !_stricmp(sect, "widescreen");
+            continue;
+        }
+        if (!in_display)
+            continue;
         if (sscanf(line, " Enabled = %d", &b) == 1 ||
             sscanf(line, " Enabled=%d", &b) == 1)
             g_enabled = b;
@@ -1906,57 +1912,49 @@ static const HMCD3D8Hooks g_hooks = {
     frame_limit,
 };
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void hmc_widescreen_init(HINSTANCE inst)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        g_inst = inst;                 /* for the letterbox backdrop's class */
-        GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
-        char *sl = strrchr(g_dir, '\\');
-        if (sl) *sl = 0;
-        char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\HMCWidescreen.log", g_dir);
-        g_log = fopen(logpath, "w");
-        read_config();
-        read_game_resolution();
-        /* Try the opportunistic resolution-snap patch. The renderer is inside
-         * HitmanContracts.exe, mapped from process start, so this resolves
-         * synchronously (and, when the signature is absent for this build,
-         * simply hands off to the runtime clamps); the watchdog is a fallback. */
-        if (g_enabled && !patch_renderer_snap())
-            CreateThread(NULL, 0, snap_watch, NULL, 0, NULL);
-        else
-            g_snap_done = 1;
-        if (g_enabled)
-            patch_postfilter_fullres();
-        if (g_enabled)
-            patch_force_winmouse();
-        if (g_enabled)
-            hook_clipcursor();     /* fix the mouse-look edge wall (Wine) */
-        if (g_enabled)
-            hook_dinput();         /* fix DI camera motion at slow speed (Wine) */
-        if (g_enabled)
-            CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
-        logf_("HMC Widescreen loaded%s, Fullscreen=%d Borderless=%d "
-              "FOVCorrect=%d FOVFactor=%.2f PreserveAspect=%d FpsCap=%d "
-              "VSync=%d MouseClipFix=%d MouseMotionFix=%d, "
-              "HitmanContracts.ini resolution %dx%d",
-              g_enabled ? "" : " (disabled)",
-              g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
-              g_preserveaspect, g_fpscap, g_vsync, g_mouseclipfix,
-              g_mousemotionfix, g_ini_w, g_ini_h);
+    g_inst = inst;                 /* for the letterbox backdrop's class */
+    GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
+    char *sl = strrchr(g_dir, '\\');
+    if (sl) *sl = 0;
+    read_config();
+    read_game_resolution();
+    /* Try the opportunistic resolution-snap patch. The renderer is inside
+     * HitmanContracts.exe, mapped from process start, so this resolves
+     * synchronously (and, when the signature is absent for this build,
+     * simply hands off to the runtime clamps); the watchdog is a fallback. */
+    if (g_enabled && !patch_renderer_snap())
+        CreateThread(NULL, 0, snap_watch, NULL, 0, NULL);
+    else
+        g_snap_done = 1;
+    if (g_enabled)
+        patch_postfilter_fullres();
+    if (g_enabled)
+        patch_force_winmouse();
+    if (g_enabled)
+        hook_clipcursor();     /* fix the mouse-look edge wall (Wine) */
+    if (g_enabled)
+        hook_dinput();         /* fix DI camera motion at slow speed (Wine) */
+    if (g_enabled)
+        CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
+    logf_("HMC Widescreen loaded%s, Fullscreen=%d Borderless=%d "
+          "FOVCorrect=%d FOVFactor=%.2f PreserveAspect=%d FpsCap=%d "
+          "VSync=%d MouseClipFix=%d MouseMotionFix=%d, "
+          "HitmanContracts.ini resolution %dx%d",
+          g_enabled ? "" : " (disabled)",
+          g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
+          g_preserveaspect, g_fpscap, g_vsync, g_mouseclipfix,
+          g_mousemotionfix, g_ini_w, g_ini_h);
 
-        HMODULE loader = GetModuleHandleA("d3d8.dll");
-        hmc_register_fn reg = loader ? (hmc_register_fn)(uintptr_t)
-            GetProcAddress(loader, "HMC_RegisterD3D8Hooks") : NULL;
-        if (reg) {
-            reg(&g_hooks);
-            logf_("registered D3D8 hooks with the loader");
-        } else {
-            logf_("d3d8.dll loader / HMC_RegisterD3D8Hooks not found — "
-                  "is the bundled d3d8.dll installed and overridden?");
-        }
+    HMODULE loader = GetModuleHandleA("d3d8.dll");
+    hmc_register_fn reg = loader ? (hmc_register_fn)(uintptr_t)
+        GetProcAddress(loader, "HMC_RegisterD3D8Hooks") : NULL;
+    if (reg) {
+        reg(&g_hooks);
+        logf_("registered D3D8 hooks with the loader");
+    } else {
+        logf_("d3d8.dll loader / HMC_RegisterD3D8Hooks not found — "
+              "is the bundled d3d8.dll installed and overridden?");
     }
-    return TRUE;
 }

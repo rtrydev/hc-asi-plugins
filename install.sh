@@ -11,8 +11,9 @@ esac
 GAME="${HMC_GAME_DIR:-$DEFAULT_GAME}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-if [ "$1" = "-u" ]; then
-    rm -f "$GAME/d3d8.dll"
+# Pre-rename artifact/config/log names (one ASI per feature, CamelCase); an
+# install over an old layout migrates the config and removes these.
+remove_legacy() {
     rm -f "$GAME/scripts/HMCAsiLoader.log"
     rm -f "$GAME/scripts/HMCWidescreen.asi"
     rm -f "$GAME/scripts/HMCWidescreen.log"
@@ -21,6 +22,19 @@ if [ "$1" = "-u" ]; then
     rm -rf "$GAME/scripts/HMCReducedX87"
     rm -f "$GAME/scripts/HMCProfiler.asi"
     rm -f "$GAME/scripts/HMCProfiler.log"
+    rm -f "$GAME/scripts/HMCReducedX87-diag.asi"
+}
+
+if [ "$1" = "-u" ]; then
+    rm -f "$GAME/d3d8.dll"
+    rm -f "$GAME/scripts/hmc_asi_loader.log"
+    rm -f "$GAME/scripts/hmc_display.asi"
+    rm -f "$GAME/scripts/hmc_display.log"
+    rm -f "$GAME/scripts/hmc_reduced_x87.asi"
+    rm -f "$GAME/scripts/hmc_reduced_x87_diag.asi"
+    rm -f "$GAME/scripts/hmc_reduced_x87.log"
+    rm -rf "$GAME/scripts/hmc_reduced_x87"
+    remove_legacy
     # the plugin .ini is user config; left in place on purpose.
     # HitmanContracts.ini is not touched on uninstall; restore
     # HitmanContracts.ini.bak by hand to undo the Resolution line.
@@ -29,7 +43,7 @@ if [ "$1" = "-u" ]; then
 fi
 
 [ -f "$HERE/dist/d3d8.dll" ] || { echo "build first: (cd runtime && make)"; exit 1; }
-[ -f "$HERE/dist/HMCWidescreen.asi" ] || { echo "build first: (cd runtime && make)"; exit 1; }
+[ -f "$HERE/dist/hmc_display.asi" ] || { echo "build first: (cd runtime && make)"; exit 1; }
 [ -d "$GAME" ] || { echo "game dir not found: $GAME (set HMC_GAME_DIR)"; exit 1; }
 
 mkdir -p "$GAME/scripts"
@@ -37,42 +51,53 @@ mkdir -p "$GAME/scripts"
 # ASI loader: d3d8.dll proxy in the game root (also carries the D3D8 hooks)
 cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 
-# Widescreen + startup fix plugin
-cp "$HERE/dist/HMCWidescreen.asi" "$GAME/scripts/"
-if [ ! -f "$GAME/scripts/HMCWidescreen.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n' \
-        > "$GAME/scripts/HMCWidescreen.ini"
+# Display plugin: widescreen + startup fix + mouse/pacing fixes + the
+# profiler overlay, one ASI. Config: hmc_display.ini, sections [display]
+# (widescreen/startup keys, also read by the d3d8.dll loader) and [profiler].
+cp "$HERE/dist/hmc_display.asi" "$GAME/scripts/"
+if [ ! -f "$GAME/scripts/hmc_display.ini" ]; then
+    if [ -f "$GAME/scripts/HMCWidescreen.ini" ]; then
+        # migrate the pre-rename per-plugin configs, keys preserved as-is
+        {
+            echo "[display]"
+            grep -v '^\[' "$GAME/scripts/HMCWidescreen.ini"
+            echo ""
+            echo "[profiler]"
+            if [ -f "$GAME/scripts/HMCProfiler.ini" ]; then
+                grep -v '^\[' "$GAME/scripts/HMCProfiler.ini"
+            else
+                printf 'Enabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n'
+            fi
+        } > "$GAME/scripts/hmc_display.ini"
+        echo "migrated HMCWidescreen.ini/HMCProfiler.ini -> hmc_display.ini"
+    else
+        # ShowCPU=0 by default: the CPU-share breakdown suspends the game's
+        # main thread to sample it, which costs frame time — set ShowCPU=1
+        # only when you want the X87/GAME/REST diagnostic.
+        printf '[display]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n\n[profiler]\nEnabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n' \
+            > "$GAME/scripts/hmc_display.ini"
+    fi
 fi
+rm -f "$GAME/scripts/HMCWidescreen.ini" "$GAME/scripts/HMCProfiler.ini"
 
 # Reduced-precision x87 plugin: the SSE2-translated HitmanContracts.exe blob for
 # CrossOver/Rosetta 2 performance. The .asi loads any <module>.x87 blob from
-# scripts/HMCReducedX87/. Contracts is a single unpacked exe, so there is just
+# scripts/hmc_reduced_x87/. Contracts is a single unpacked exe, so there is just
 # one blob (HitmanContracts.exe.x87) — no separate renderer DLL, no dump step.
-if [ -f "$HERE/dist/HMCReducedX87.asi" ] && [ -f "$HERE/dist/HitmanContracts.exe.x87" ]; then
-    cp "$HERE/dist/HMCReducedX87.asi" "$GAME/scripts/"
-    mkdir -p "$GAME/scripts/HMCReducedX87"
-    cp "$HERE/dist/HitmanContracts.exe.x87" "$GAME/scripts/HMCReducedX87/"
-    echo "x87 plugin: HMCReducedX87.asi + HitmanContracts.exe.x87 installed"
+if [ -f "$HERE/dist/hmc_reduced_x87.asi" ] && [ -f "$HERE/dist/HitmanContracts.exe.x87" ]; then
+    cp "$HERE/dist/hmc_reduced_x87.asi" "$GAME/scripts/"
+    mkdir -p "$GAME/scripts/hmc_reduced_x87"
+    cp "$HERE/dist/HitmanContracts.exe.x87" "$GAME/scripts/hmc_reduced_x87/"
+    echo "x87 plugin: hmc_reduced_x87.asi + HitmanContracts.exe.x87 installed"
 else
     echo "NOTE: x87 plugin not installed (run tools/translate.py, then rebuild)"
 fi
 
-# Performance profiler overlay (top-right): FPS/frame time + EIP-sampled CPU
-# share (translated x87 blob vs untranslated exe vs rest).
-if [ -f "$HERE/dist/HMCProfiler.asi" ]; then
-    cp "$HERE/dist/HMCProfiler.asi" "$GAME/scripts/"
-    if [ ! -f "$GAME/scripts/HMCProfiler.ini" ]; then
-        # ShowCPU=0 by default: the CPU-share breakdown suspends the game's main
-        # thread to sample it, which costs frame time — leave it off for play and
-        # set ShowCPU=1 only when you want the X87/GAME/REST diagnostic.
-        printf '[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n' \
-            > "$GAME/scripts/HMCProfiler.ini"
-    fi
-    echo "profiler: HMCProfiler.asi installed (top-right overlay)"
-fi
+# Drop any pre-rename plugin files so the loader does not load a feature twice.
+remove_legacy
 
 # Give widescreen out of the box. HitmanContracts.ini has no "Resolution" line
-# by default (the engine falls back to a built-in default), and the widescreen
+# by default (the engine falls back to a built-in default), and the display
 # plugin pins the backbuffer to this line, so make sure one exists. Set
 # HMC_RESOLUTION=WxH to override, or to your display resolution for a
 # pixel-exact borderless fill. The original is backed up to
@@ -106,7 +131,7 @@ if [ -f "$INI" ]; then
     fi
 
     # Mouse: winemac makes the stock DirectInput mouse misbehave in two ways, both
-    # fixed at runtime by the widescreen plugin (all auto under Wine, no ini edit):
+    # fixed at runtime by the display plugin (all auto under Wine, no ini edit):
     #   - ForceWinMouse  : buttons/firing (DirectInput carries motion but not
     #                      button state on this stack) — kept on the DirectInput
     #                      path so clicks work;
@@ -164,10 +189,9 @@ elif [ -n "$WINE" ] || [ -x "/Applications/CrossOver.app/Contents/SharedSupport/
 fi
 
 echo "installed to $GAME"
-echo "  loader:     $GAME/d3d8.dll"
-echo "  plugin:     $GAME/scripts/HMCWidescreen.asi"
-echo "  config:     $GAME/scripts/HMCWidescreen.ini"
-echo "  x87 plugin: $GAME/scripts/HMCReducedX87.asi (+ HMCReducedX87/HitmanContracts.exe.x87)"
-echo "  profiler:   $GAME/scripts/HMCProfiler.asi (top-right overlay)"
-echo "logs after launch: HMCAsiLoader.log, HMCWidescreen.log, HMCReducedX87.log, HMCProfiler.log"
+echo "  loader:      $GAME/d3d8.dll"
+echo "  display:     $GAME/scripts/hmc_display.asi (widescreen + profiler overlay)"
+echo "  config:      $GAME/scripts/hmc_display.ini"
+echo "  x87 plugin:  $GAME/scripts/hmc_reduced_x87.asi (+ hmc_reduced_x87/HitmanContracts.exe.x87)"
+echo "logs after launch: hmc_asi_loader.log, hmc_display.log, hmc_reduced_x87.log"
 echo "Launch through Steam so the game's Steam check passes."
