@@ -201,7 +201,24 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                 memcpy(&iv1, q + 4, 4);
                 if (iv0 == ow && iv1 == oh) {
                     int site = candidates++;
-                    if (!(g_patch_mask & (1u << site))) continue;
+                    int selected;
+                    if (g_patch_mask) {
+                        selected = site < 32 &&
+                                   (g_patch_mask & (1u << site));
+                    } else {
+                        /* RenderSettings stores current/pending resolution
+                         * pairs at packed object+0x71 and +0x79. The object is
+                         * 16-byte aligned. This signature is stable across
+                         * Wine/native heaps; ordinal candidate numbers are not. */
+                        uint32_t iv2 = 0, iv3 = 0;
+                        if (q + 16 <= base + size) {
+                            memcpy(&iv2, q + 8, 4);
+                            memcpy(&iv3, q + 12, 4);
+                        }
+                        selected = ((uintptr_t)q & 0xf) == 1 &&
+                                   iv2 == ow && iv3 == oh;
+                    }
+                    if (!selected) continue;
                     memcpy(q, &nw, 4);
                     memcpy(q + 4, &nh, 4);
                     if (g_n_reassert < (int)(sizeof(g_reassert) /
@@ -222,7 +239,8 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                     memcpy(&fv1, q + 4, 4);
                     if (fv0 == owf && fv1 == ohf) {
                         int site = candidates++;
-                        if (!(g_patch_mask & (1u << site))) continue;
+                        if (!g_patch_mask || site >= 32 ||
+                            !(g_patch_mask & (1u << site))) continue;
                         memcpy(q, &nwf, 4);
                         memcpy(q + 4, &nhf, 4);
                         if (g_n_reassert < (int)(sizeof(g_reassert) /
@@ -246,8 +264,9 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
         p = base + size;
     }
     logf_("re-believe %dx%d -> %dx%d: %d/%d candidate site(s) patched "
-          "(mask=0x%x; %d int + %d float)", rw, rh, lw, lh,
-          ints + floats, candidates, g_patch_mask, ints, floats);
+          "(%s=0x%x; %d int + %d float)", rw, rh, lw, lh,
+          ints + floats, candidates,
+          g_patch_mask ? "mask" : "structural", g_patch_mask, ints, floats);
     return ints + floats;
 }
 
