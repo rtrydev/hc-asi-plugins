@@ -306,9 +306,9 @@ the render resolution and the UI is laid out at `Resolution/N`. For example,
 1280x800-sized UI.
 
 The implementation is platform-specific but hidden from configuration. On
-Wine/CrossOver the plugin briefly supplies the divided resolution during the
-engine's startup parse, restores `HitmanContracts.ini` before D3D creation,
-then uses the fast viewport-only grow path. On native Windows it structurally
+Wine/CrossOver the plugin substitutes the divided resolution only in the
+engine's `ReadFile` buffer during startup parsing; the physical INI is never
+modified. It then uses the fast viewport-only grow path. On native Windows it structurally
 identifies and patches the UI settings allocation. This avoids the 15–30 FPS
 D3DMetal penalty from per-draw RHW/UV interception while keeping one portable
 configuration.

@@ -135,7 +135,6 @@ static int g_render_w, g_render_h;  /* UIScale>1 re-believed: the
                                      * patched to believe. 0 = not
                                      * re-believed */
 static int g_uiscale_grow;          /* UIScale<-1: ini is layout, bb grows */
-static int g_ini_spoofed;           /* Wine + UIScale>1: disk briefly layout */
 static int g_mode_w, g_mode_h;      /* adapter display mode (physical pixels;
                                      * on Retina = 2x the logical desktop) */
 static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
@@ -152,6 +151,7 @@ static int g_cursorfix = 0;        /* 0 off (default), 1 on, -1 auto (Wine).
                                     * movement feel heavy — net negative. */
 static HWND g_game_hwnd;           /* the game window, learned at device init */
 static int is_wine(void);
+static int install_ini_virtualization(int rw, int rh, int lw, int lh);
 
 /* uiscale.c hook (D3D-typed, so declared here rather than hmc_plugin.h) */
 void hmc_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned int bbw,
@@ -287,43 +287,11 @@ static void read_game_resolution(void)
     fclose(f);
 }
 
-static int rewrite_game_resolution(int from_w, int from_h, int to_w, int to_h)
-{
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\..\\HitmanContracts.ini", g_dir);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char out[8192], line[512];
-    size_t o = 0;
-    int changed = 0;
-    while (fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        int w = 0, h = 0;
-        if (_strnicmp(p, "Resolution", 10) == 0 &&
-            sscanf(p + 10, " %dx%d", &w, &h) == 2 &&
-            w == from_w && h == from_h) {
-            snprintf(line, sizeof(line), "Resolution %dx%d\n", to_w, to_h);
-            changed = 1;
-        }
-        size_t l = strlen(line);
-        if (o + l >= sizeof(out)) { changed = 0; break; }
-        memcpy(out + o, line, l); o += l;
-    }
-    fclose(f);
-    if (!changed) return 0;
-    f = fopen(path, "w");
-    if (!f) return 0;
-    fwrite(out, 1, o, f);
-    fclose(f);
-    return 1;
-}
-
 /* Under Wine, make the engine naturally parse the layout resolution while
  * keeping the user's persistent Resolution as the render resolution. The
- * proxy/ASI loads before the executable parses its ini; fix_present restores
- * the file before creating D3D. This reproduces fast grow mode without asking
- * users to coordinate two settings. */
+ * proxy/ASI loads before the executable parses its ini; a scoped ReadFile IAT
+ * hook virtualizes only that read. This reproduces fast grow mode without
+ * touching the physical file or asking users to coordinate two settings. */
 static void prepare_wine_positive_grow(void)
 {
     if (!is_wine() || g_uiscale_cfg <= 1.0f || !g_ini_w || !g_ini_h) return;
@@ -331,23 +299,13 @@ static void prepare_wine_positive_grow(void)
     int lw = (int)(lround((double)rw / g_uiscale_cfg / 2.0) * 2);
     int lh = (int)(lround((double)rh / g_uiscale_cfg / 2.0) * 2);
     if (lw < 320 || lh < 200) return;
-    if (!rewrite_game_resolution(rw, rh, lw, lh)) return;
+    if (!install_ini_virtualization(rw, rh, lw, lh)) return;
     g_render_w = rw; g_render_h = rh;
     g_ini_w = lw; g_ini_h = lh;
     g_uiscale_grow = 1;
-    g_ini_spoofed = 1;
-    logf_("UIScale=%.2f on Wine: engine ini parse temporarily %dx%d; "
-          "persistent/render resolution remains %dx%d",
+    logf_("UIScale=%.2f on Wine: engine ini read virtualized to %dx%d; "
+          "physical/render resolution remains %dx%d",
           (double)g_uiscale_cfg, lw, lh, rw, rh);
-}
-
-static void restore_spoofed_ini(void)
-{
-    if (!g_ini_spoofed) return;
-    if (rewrite_game_resolution(g_ini_w, g_ini_h, g_render_w, g_render_h))
-        logf_("HitmanContracts.ini restored to render resolution %dx%d",
-              g_render_w, g_render_h);
-    g_ini_spoofed = 0;
 }
 
 /* UIScale re-believe drift guard, called at process detach: if the engine
@@ -357,7 +315,6 @@ static void restore_spoofed_ini(void)
  * in-game switch changed it) is left alone. */
 static void restore_ini_resolution(void)
 {
-    restore_spoofed_ini();
     if (g_uiscale_grow) return; /* ini intentionally remains layout-sized */
     if (!g_render_w || !g_render_h) return;
     char path[MAX_PATH];
@@ -651,6 +608,112 @@ static int iat_hook(HMODULE mod, const char *dll, const char *fn,
         }
     }
     return 0;
+}
+
+/* Wine UIScale read virtualization. Only the main executable's imports are
+ * redirected; CRT/plugin file access is unaffected. */
+static HANDLE (WINAPI *g_real_createfilea)(LPCSTR, DWORD, DWORD,
+    LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static HANDLE (WINAPI *g_real_createfilew)(LPCWSTR, DWORD, DWORD,
+    LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static BOOL (WINAPI *g_real_readfile)(HANDLE, LPVOID, DWORD, LPDWORD,
+    LPOVERLAPPED);
+static BOOL (WINAPI *g_real_closehandle)(HANDLE);
+static HANDLE g_virtual_ini = INVALID_HANDLE_VALUE;
+static char g_ini_real_line[64], g_ini_layout_line[64];
+static size_t g_ini_real_len, g_ini_layout_len;
+
+static int ini_basename_a(const char *p)
+{
+    if (!p) return 0;
+    const char *b = p;
+    for (const char *s = p; *s; s++) if (*s == '\\' || *s == '/') b = s + 1;
+    return _stricmp(b, "HitmanContracts.ini") == 0;
+}
+
+static int ini_basename_w(const wchar_t *p)
+{
+    if (!p) return 0;
+    const wchar_t *b = p;
+    for (const wchar_t *s = p; *s; s++) if (*s == L'\\' || *s == L'/') b = s + 1;
+    return _wcsicmp(b, L"HitmanContracts.ini") == 0;
+}
+
+static HANDLE WINAPI my_createfilea(LPCSTR p, DWORD access, DWORD share,
+    LPSECURITY_ATTRIBUTES sa, DWORD create, DWORD flags, HANDLE templ)
+{
+    HANDLE h = g_real_createfilea(p, access, share, sa, create, flags, templ);
+    if (h != INVALID_HANDLE_VALUE && ini_basename_a(p) &&
+        (access & GENERIC_READ))
+        g_virtual_ini = h;
+    return h;
+}
+
+static HANDLE WINAPI my_createfilew(LPCWSTR p, DWORD access, DWORD share,
+    LPSECURITY_ATTRIBUTES sa, DWORD create, DWORD flags, HANDLE templ)
+{
+    HANDLE h = g_real_createfilew(p, access, share, sa, create, flags, templ);
+    if (h != INVALID_HANDLE_VALUE && ini_basename_w(p) &&
+        (access & GENERIC_READ))
+        g_virtual_ini = h;
+    return h;
+}
+
+static BOOL WINAPI my_readfile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got,
+                               LPOVERLAPPED ov)
+{
+    BOOL ok = g_real_readfile(h, buf, n, got, ov);
+    if (!ok || h != g_virtual_ini || !buf || !got || ov ||
+        g_ini_layout_len > g_ini_real_len)
+        return ok;
+    BYTE *p = (BYTE *)buf;
+    size_t size = *got;
+    for (size_t i = 0; i + g_ini_real_len <= size; i++) {
+        if (memcmp(p + i, g_ini_real_line, g_ini_real_len) != 0) continue;
+        memcpy(p + i, g_ini_layout_line, g_ini_layout_len);
+        memset(p + i + g_ini_layout_len, ' ',
+               g_ini_real_len - g_ini_layout_len);
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            logf_("HitmanContracts.ini Resolution virtualized in engine "
+                  "ReadFile buffer (disk untouched)");
+        }
+        break;
+    }
+    return ok;
+}
+
+static BOOL WINAPI my_closehandle(HANDLE h)
+{
+    if (h == g_virtual_ini) g_virtual_ini = INVALID_HANDLE_VALUE;
+    return g_real_closehandle(h);
+}
+
+static int install_ini_virtualization(int rw, int rh, int lw, int lh)
+{
+    g_ini_real_len = (size_t)snprintf(g_ini_real_line,
+        sizeof(g_ini_real_line), "Resolution %dx%d", rw, rh);
+    g_ini_layout_len = (size_t)snprintf(g_ini_layout_line,
+        sizeof(g_ini_layout_line), "Resolution %dx%d", lw, lh);
+    if (!g_ini_real_len || g_ini_real_len >= sizeof(g_ini_real_line) ||
+        !g_ini_layout_len || g_ini_layout_len > g_ini_real_len)
+        return 0;
+    HMODULE exe = GetModuleHandleA(NULL);
+    int a = iat_hook(exe, "KERNEL32.dll", "CreateFileA",
+                     (void *)my_createfilea, (void **)&g_real_createfilea);
+    int w = iat_hook(exe, "KERNEL32.dll", "CreateFileW",
+                     (void *)my_createfilew, (void **)&g_real_createfilew);
+    int r = iat_hook(exe, "KERNEL32.dll", "ReadFile",
+                     (void *)my_readfile, (void **)&g_real_readfile);
+    int c = iat_hook(exe, "KERNEL32.dll", "CloseHandle",
+                     (void *)my_closehandle, (void **)&g_real_closehandle);
+    if ((!a && !w) || !r || !c) {
+        logf_("INI read virtualization could not arm (CreateA=%d CreateW=%d "
+              "Read=%d Close=%d)", a, w, r, c);
+        return 0;
+    }
+    return 1;
 }
 
 static BOOL (WINAPI *g_real_setcursorpos)(int, int);
@@ -1721,7 +1784,6 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
                         int is_reset)
 {
     if (!g_enabled) return;
-    restore_spoofed_ini();
     int was_fullscreen = !pp->Windowed;
 
     /* The engine picks its backbuffer format ONCE, at boot (ColorDepth 32 ->
