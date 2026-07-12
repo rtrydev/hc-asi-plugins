@@ -1637,6 +1637,26 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
     if (!g_enabled) return;
     int was_fullscreen = !pp->Windowed;
 
+    /* The engine picks its backbuffer format ONCE, at boot (ColorDepth 32 ->
+     * A8R8G8B8 — the destination-alpha channel the ground detail-texture
+     * blending needs). A later request can arrive as X8R8G8B8 instead: the
+     * in-game resolution switch derives its Reset request from the mode-list
+     * entry, and display-mode entries are always X8 (there is no A8 display
+     * format; ModernModes' curated list is X8 for the same reason — the
+     * engine filters for it). Letting that downgrade through strips the
+     * alpha channel and reproduces the flat/see-through-texture bug, so put
+     * the boot-time format back. */
+    static D3DFORMAT s_boot_fmt = D3DFMT_UNKNOWN;
+    if (!is_reset && s_boot_fmt == D3DFMT_UNKNOWN)
+        s_boot_fmt = pp->BackBufferFormat;
+    if (s_boot_fmt == D3DFMT_A8R8G8B8 &&
+        pp->BackBufferFormat == D3DFMT_X8R8G8B8) {
+        logf_("%s requested X8R8G8B8 — restoring the boot-time A8R8G8B8 "
+              "(keeps the destination-alpha channel)",
+              is_reset ? "reset" : "device create");
+        pp->BackBufferFormat = D3DFMT_A8R8G8B8;
+    }
+
     /* Record the game window for the cursor hooks/watchdog, and assert the
      * hidden cursor from here — CreateDevice/Reset run on the game's thread,
      * so this covers startup and mission loads on every path (including
@@ -1734,7 +1754,19 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
         is_display_mode((int)pp->BackBufferWidth,
                         (int)pp->BackBufferHeight)) {
         pp->Windowed = FALSE;
-        pp->BackBufferFormat = D3DFMT_X8R8G8B8;
+        /* Keep the game's requested backbuffer format here too. This used
+         * to force X8R8G8B8, which stripped the destination-alpha channel
+         * the ground detail-texture blending reads — the same flat/
+         * see-through-texture bug the WINDOWED path fixed long ago, but
+         * surviving on this native-Windows-only branch (Wine never takes
+         * it). The stock game runs exclusive fullscreen with an A8R8G8B8
+         * backbuffer over the X8 display mode — a standard D3D8 combination
+         * — so there is nothing to work around; only an UNKNOWN request
+         * needs a concrete display-class format. Were a driver ever to
+         * reject it, the loader's CreateDevice safe fallback (windowed,
+         * which also keeps A8) still brings the game up. */
+        if (pp->BackBufferFormat == D3DFMT_UNKNOWN)
+            pp->BackBufferFormat = D3DFMT_X8R8G8B8;
         pp->FullScreen_RefreshRateInHz = 0;   /* default refresh */
         if (pp->SwapEffect == D3DSWAPEFFECT_COPY)
             pp->SwapEffect = D3DSWAPEFFECT_DISCARD;

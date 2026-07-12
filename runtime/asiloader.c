@@ -1567,9 +1567,17 @@ static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
 {
     typedef HRESULT (WINAPI *rs_t)(IDirect3DDevice8 *, D3DPRESENT_PARAMETERS *);
     if (pp)
+        logf_("Reset requested: %ux%u fmt=%d windowed=%d",
+              pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat,
+              pp->Windowed);
+    if (pp)
         for (int i = 0; i < g_n_hooks; i++)
             if (g_hooks[i].fix_present)
                 g_hooks[i].fix_present(pp, NULL, 1);
+    if (pp)
+        logf_("Reset applied:   %ux%u fmt=%d windowed=%d",
+              pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat,
+              pp->Windowed);
     if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
     /* The old swapchain (and the game's default-pool textures) die in the
      * Reset whether or not it succeeds — forget them before forwarding. */
