@@ -257,17 +257,27 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
 int hmc_uiscale_reassert(void)
 {
     int n = 0;
+    static int logged;
     for (int i = 0; i < g_n_reassert; i++) {
         MEMORY_BASIC_INFORMATION mbi;
         if (VirtualQuery(g_reassert[i].p, &mbi, sizeof(mbi)) != sizeof(mbi) ||
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
             continue;
+        uint32_t a, b;
+        memcpy(&a, g_reassert[i].p, 4);
+        memcpy(&b, g_reassert[i].p + 4, 4);
+        if (a == g_reassert[i].a && b == g_reassert[i].b)
+            continue;
         memcpy(g_reassert[i].p, &g_reassert[i].a, 4);
         memcpy(g_reassert[i].p + 4, &g_reassert[i].b, 4);
         n++;
     }
-    if (n) logf_("native post-device UI resolution reasserted at %d site(s)", n);
+    if (n && !logged) {
+        logged = 1;
+        logf_("native post-device UI resolution reasserted before viewport "
+              "at %d site(s)", n);
+    }
     return n;
 }
 
@@ -355,6 +365,11 @@ void hmc_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned bbw, unsigned bbh)
 {
     (void)bbw; (void)bbh;
     if (!g_active || !vp) return;
+    /* Native Contracts can refresh its device-derived settings immediately
+     * before establishing the frame viewport. Reassert the exact packed UI
+     * fields here, before layout-space rendering for this frame begins. */
+    if (g_cfg_uiscale > 1.0f && g_n_reassert)
+        hmc_uiscale_reassert();
     if (vp->X + vp->Width  > (DWORD)g_ini_w + 2 ||
         vp->Y + vp->Height > (DWORD)g_ini_h + 2)
         return;

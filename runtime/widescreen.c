@@ -2066,12 +2066,6 @@ static void wait_until(LONGLONG deadline, LONGLONG freq)
  * there is a single, consistent clock — no two-clock beat. */
 static void frame_limit(void)
 {
-    static int native_uiscale_reasserted;
-    if (!native_uiscale_reasserted && !is_wine() && !g_uiscale_grow &&
-        hmc_uiscale_cfg() > 1.0f) {
-        native_uiscale_reasserted = 1;
-        hmc_uiscale_reassert();
-    }
     /* UIScale + UIScalePostFilter=0: keep the parsed PostFilterLOD at 0
      * (an in-game detail-setting change writes it back mid-session; see
      * uiscale.c) */
