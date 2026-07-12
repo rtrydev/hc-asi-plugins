@@ -171,6 +171,38 @@ void hmc_uiscale_setup_viewport(int ini_w, int ini_h,
  * fixes. The mode-list entries still match and are patched too; that is
  * cosmetic for the in-game resolution menu, which is locked during
  * re-believe anyway. */
+static void *find_ui_settings_allocation(uint32_t ow, uint32_t oh,
+                                         uint8_t *exe)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t *p = (uint8_t *)0x10000;
+    while ((uintptr_t)p < 0x7fff0000u &&
+           VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        uint8_t *base = (uint8_t *)mbi.BaseAddress;
+        SIZE_T size = mbi.RegionSize;
+        int writable = mbi.State == MEM_COMMIT &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        int engine_img = exe && (uint8_t *)mbi.AllocationBase == exe;
+        int priv = mbi.Type == MEM_PRIVATE;
+        int our_stack = (uint8_t *)&mbi >= base &&
+                        (uint8_t *)&mbi < base + size;
+        if (writable && (engine_img || priv) && !our_stack) {
+            for (uint8_t *q = base; q + 16 <= base + size; q++) {
+                uint32_t a, b, c, d;
+                memcpy(&a, q, 4); memcpy(&b, q + 4, 4);
+                memcpy(&c, q + 8, 4); memcpy(&d, q + 12, 4);
+                if (((uintptr_t)q & 0xf) == 1 &&
+                    a == ow && b == oh && c == ow && d == oh)
+                    return mbi.AllocationBase;
+            }
+        }
+        p = base + size;
+    }
+    return NULL;
+}
+
 int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
 {
     const uint32_t ow = (uint32_t)rw, oh = (uint32_t)rh;
@@ -178,6 +210,8 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
     const float owf = (float)rw, ohf = (float)rh;
     const float nwf = (float)lw, nhf = (float)lh;
     uint8_t *exe = (uint8_t *)GetModuleHandleA(NULL);
+    void *ui_alloc = g_patch_mask ? NULL :
+        find_ui_settings_allocation(ow, oh, exe);
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *p = (uint8_t *)0x10000;
     int ints = 0, floats = 0, candidates = 0;
@@ -206,17 +240,10 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                         selected = site < 32 &&
                                    (g_patch_mask & (1u << site));
                     } else {
-                        /* RenderSettings stores current/pending resolution
-                         * pairs at packed object+0x71 and +0x79. The object is
-                         * 16-byte aligned. This signature is stable across
-                         * Wine/native heaps; ordinal candidate numbers are not. */
-                        uint32_t iv2 = 0, iv3 = 0;
-                        if (q + 16 <= base + size) {
-                            memcpy(&iv2, q + 8, 4);
-                            memcpy(&iv3, q + 12, 4);
-                        }
-                        selected = ((uintptr_t)q & 0xf) == 1 &&
-                                   iv2 == ow && iv3 == oh;
+                        /* The packed +0x71/+0x79 pair identifies the owning
+                         * settings allocation. Patch its aligned mirrors too;
+                         * they drive native viewport/UI layout. */
+                        selected = ui_alloc && mbi.AllocationBase == ui_alloc;
                     }
                     if (!selected) continue;
                     memcpy(q, &nw, 4);
@@ -239,8 +266,10 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                     memcpy(&fv1, q + 4, 4);
                     if (fv0 == owf && fv1 == ohf) {
                         int site = candidates++;
-                        if (!g_patch_mask || site >= 32 ||
-                            !(g_patch_mask & (1u << site))) continue;
+                        int selected = g_patch_mask ?
+                            (site < 32 && (g_patch_mask & (1u << site))) :
+                            (ui_alloc && mbi.AllocationBase == ui_alloc);
+                        if (!selected) continue;
                         memcpy(q, &nwf, 4);
                         memcpy(q + 4, &nhf, 4);
                         if (g_n_reassert < (int)(sizeof(g_reassert) /
