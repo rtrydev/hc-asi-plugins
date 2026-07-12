@@ -66,6 +66,9 @@ static int      g_ini_w, g_ini_h;     /* believed (layout) resolution */
 static unsigned g_bb_w, g_bb_h;       /* real backbuffer */
 static double   g_kx = 1.0, g_ky = 1.0;
 static int      g_vp_logs;
+typedef struct { uint8_t *p; uint32_t a, b; } ReassertSite;
+static ReassertSite g_reassert[16];
+static int g_n_reassert;
 
 void hmc_uiscale_config(float uiscale)
 {
@@ -178,6 +181,7 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *p = (uint8_t *)0x10000;
     int ints = 0, floats = 0, candidates = 0;
+    g_n_reassert = 0;
     while ((uintptr_t)p < 0x7fff0000u &&
            VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
         uint8_t *base = (uint8_t *)mbi.BaseAddress;
@@ -200,6 +204,11 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                     if (!(g_patch_mask & (1u << site))) continue;
                     memcpy(q, &nw, 4);
                     memcpy(q + 4, &nh, 4);
+                    if (g_n_reassert < (int)(sizeof(g_reassert) /
+                                              sizeof(g_reassert[0]))) {
+                        g_reassert[g_n_reassert++] =
+                            (ReassertSite){ q, nw, nh };
+                    }
                     if (ints + floats < 8)
                         logf_("re-believe int pair at %p%s%s",
                               q, ((uintptr_t)q & 3) ? " (unaligned)" : "",
@@ -216,6 +225,13 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                         if (!(g_patch_mask & (1u << site))) continue;
                         memcpy(q, &nwf, 4);
                         memcpy(q + 4, &nhf, 4);
+                        if (g_n_reassert < (int)(sizeof(g_reassert) /
+                                                  sizeof(g_reassert[0]))) {
+                            uint32_t a, b;
+                            memcpy(&a, &nwf, 4); memcpy(&b, &nhf, 4);
+                            g_reassert[g_n_reassert++] =
+                                (ReassertSite){ q, a, b };
+                        }
                         if (ints + floats < 8)
                             logf_("re-believe float pair at %p%s%s",
                                   q, ((uintptr_t)q & 3) ? " (unaligned)" : "",
@@ -233,6 +249,26 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
           "(mask=0x%x; %d int + %d float)", rw, rh, lw, lh,
           ints + floats, candidates, g_patch_mask, ints, floats);
     return ints + floats;
+}
+
+/* Native D3D8 relayouts after CreateDevice returns and can overwrite the
+ * packed UI settings fields patched during the pre-device scan. Reapply only
+ * those exact addresses; never rescan live D3D/device memory. */
+int hmc_uiscale_reassert(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_n_reassert; i++) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(g_reassert[i].p, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            continue;
+        memcpy(g_reassert[i].p, &g_reassert[i].a, 4);
+        memcpy(g_reassert[i].p + 4, &g_reassert[i].b, 4);
+        n++;
+    }
+    if (n) logf_("native post-device UI resolution reasserted at %d site(s)", n);
+    return n;
 }
 
 /* ---- PostFilterLOD force-off ------------------------------------------

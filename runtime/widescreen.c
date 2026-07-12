@@ -125,7 +125,8 @@ static int g_mousemotionfix = -1;   /* feed the DirectInput camera motion from t
 static float g_uiscale_cfg = 0.0f;  /* [display] UIScale: 0/1 off, N>1: UI
                                      * laid out N x bigger; the ini res is
                                      * the render res (see uiscale.c) */
-static unsigned g_uiscale_patchmask = 0x04; /* legacy >1 mode: UI-owned copy */
+static unsigned g_uiscale_patchmask; /* legacy >1: platform default below */
+static int g_uiscale_patchmask_set;
 static int g_uiscale_postfx = 1;    /* [display] UIScalePostFilter: keep the
                                      * post-filter under UIScale (the loader
                                      * rescales its believed-space UVs);
@@ -153,6 +154,7 @@ static int g_cursorfix = 0;        /* 0 off (default), 1 on, -1 auto (Wine).
                                     * re-prime + SetCursorPos churn made camera
                                     * movement feel heavy — net negative. */
 static HWND g_game_hwnd;           /* the game window, learned at device init */
+static int is_wine(void);
 
 /* uiscale.c hook (D3D-typed, so declared here rather than hmc_plugin.h) */
 void hmc_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned int bbw,
@@ -237,8 +239,10 @@ static void read_config(void)
                  sscanf(line, " UIScale=%f", &v) == 1)
             g_uiscale_cfg = v;
         else if (sscanf(line, " UIScalePatchMask = %i", &b) == 1 ||
-                 sscanf(line, " UIScalePatchMask=%i", &b) == 1)
+                 sscanf(line, " UIScalePatchMask=%i", &b) == 1) {
             g_uiscale_patchmask = (unsigned)b;
+            g_uiscale_patchmask_set = 1;
+        }
         else if (sscanf(line, " UIScalePostFilter = %d", &b) == 1 ||
                  sscanf(line, " UIScalePostFilter=%d", &b) == 1)
             g_uiscale_postfx = (b != 0);
@@ -250,6 +254,8 @@ static void read_config(void)
     if (g_fpscap < 0 || g_fpscap > 1000) g_fpscap = 60;
     if (g_uiscale_cfg < -8.0f) g_uiscale_cfg = -8.0f;
     else if (g_uiscale_cfg > 8.0f) g_uiscale_cfg = 8.0f;
+    if (!g_uiscale_patchmask_set)
+        g_uiscale_patchmask = is_wine() ? 0x04u : 0x1cu;
     hmc_uiscale_config(g_uiscale_cfg);
     hmc_uiscale_patchmask(g_uiscale_patchmask);
 }
@@ -2060,6 +2066,12 @@ static void wait_until(LONGLONG deadline, LONGLONG freq)
  * there is a single, consistent clock — no two-clock beat. */
 static void frame_limit(void)
 {
+    static int native_uiscale_reasserted;
+    if (!native_uiscale_reasserted && !is_wine() && !g_uiscale_grow &&
+        hmc_uiscale_cfg() > 1.0f) {
+        native_uiscale_reasserted = 1;
+        hmc_uiscale_reassert();
+    }
     /* UIScale + UIScalePostFilter=0: keep the parsed PostFilterLOD at 0
      * (an in-game detail-setting change writes it back mid-session; see
      * uiscale.c) */
