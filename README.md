@@ -300,16 +300,18 @@ resolution, so without `UIScale` the UI-size knob is the `Resolution` line —
 a smaller resolution = a proportionally bigger UI, coupled with a softer 3D
 image (the backbuffer is pinned to it).
 
-`UIScale=N` (>1) decouples the two by **re-believing the engine** (the
-approach shared with the sibling
-[h2sa-asi-plugins](https://github.com/rtrydev/h2sa-asi-plugins) UIScale):
-the `HitmanContracts.ini Resolution` stays the **render** resolution, and the
-plugin patches the engine's already-parsed copy of it in memory to
-`Resolution/N`, so the whole 2D layer is laid out N× bigger — e.g.
-`Resolution 1920x1200` + `UIScale=1.5` renders 1920x1200 with the UI sized as
-at 1280x800. The device keeps rendering the ini resolution exactly as with
-the feature off; the believed-space leftovers (viewports the engine sets in
-layout pixels) are rescaled through the loader's v4 `fix_viewport` hook.
+`UIScale=-N` (N>1) uses the performant **grow mode**, shared with the sibling
+[h2sa-asi-plugins](https://github.com/rtrydev/h2sa-asi-plugins): the
+`HitmanContracts.ini Resolution` is the UI-layout size and the plugin grows
+only the render backbuffer by N. For example, `Resolution 1280x800` plus
+`UIScale=-2` renders at 2560x1600 with a 1280x800-sized UI. Only the handful
+of layout-space viewports are expanded; per-draw RHW/UV interception stays
+disabled. This avoids the 15–30 FPS D3DMetal penalty caused by changing the
+renderer-visible live resolution or transforming buffers on every draw.
+
+`UIScale=N` (>1) remains as a legacy compatibility mode: the ini stays the
+render resolution and the plugin selectively re-believes the UI-owned parsed
+copy to `Resolution/N`. Grow mode is recommended on CrossOver/macOS.
 
 Two Contracts-specific differences from H2SA:
 
@@ -318,13 +320,8 @@ Two Contracts-specific differences from H2SA:
   the engine has parsed its ini (H2SA's plugins load from inside the
   engine's `LoadLibrary(RenderD3D.dll)`, after the parse). The device does
   not exist yet at that point, so no device-derived copies can false-match.
-- H2SA's other mode — `UIScale=-1`, keep the ini as the layout size and
-  *grow* the backbuffer — is **not supported and treated as off**: verified
-  in-game, Contracts reads the real device size back after `CreateDevice`
-  and derives its runtime viewports and post-filter buffers from it while
-  parts of the 2D layer stay ini-derived, so that decoupling renders the UI
-  at two inconsistent scales. For the same reason a failed re-believe scan
-  means the feature stays off (no supersampling fallback).
+- `UIScale=-1` auto mode is not supported; use an explicit grow factor such
+  as `-2` so the render target is deterministic.
 
 While re-believed, the in-game resolution switch is locked for the session
 (the engine's patched belief cannot be re-pointed mid-run; a switch is
@@ -332,7 +329,8 @@ logged and applies on the next launch). If the engine saves the divided
 layout value back into `HitmanContracts.ini` on exit, a detach-time guard
 restores the render resolution so repeated launches cannot divide it twice.
 
-The **post-filter (bloom/colour-grade) runs under UIScale**: the loader
+In legacy positive-factor mode, the **post-filter (bloom/colour-grade) runs
+under UIScale**: the loader
 treats every render target of the full backbuffer size as a believed-space
 canvas (the engine renders its scene, menus and post passes through such
 RTs and blits them 1:1), rescaling the believed-space viewports and RHW
@@ -343,7 +341,8 @@ sub-rects; the content now fills the RT, so the UVs follow — full-range
 (e.g. the video player's quads) is detected by its coordinates and left
 alone.
 
-Only the engine's believed-space **2D layer** may be rescaled. That layer
+Only in legacy positive-factor mode, the engine's believed-space **2D layer**
+may be rescaled. That layer
 emits pre-transformed quads with `rhw` exactly 1 and `z` in 0..1, and its
 vertex stride matches the tracked FVF — any RHW draw failing those checks
 (e.g. software-projected world geometry, whose on-screen coordinates can
@@ -354,6 +353,12 @@ textures" of the old X8-backbuffer bug back in the same spots. Skipped
 draws log one-shot `UIScale: ... left unscaled` lines; `UIScaleStrict2D=0`
 restores the old bounds-only classification if a UI element ever stops
 scaling.
+
+Legacy-mode vertex-buffer UI quads are transformed in place at the end of the engine's
+existing write lock. This is deliberately not done by reopening buffers from
+the draw hook: a read lock serializes D3DMetal, and redirecting the result
+through `Draw*UP` adds a second upload. That older path cost roughly 15 FPS on
+CrossOver even though each individual UI quad contains only four vertices.
 
 If the post path ever misbehaves, `UIScalePostFilter=0` is the
 fallback: it forces the engine's parsed `PostFilterLOD` to 0 in memory
@@ -399,9 +404,9 @@ RainSystemCap=0     ; rain CPU limiter, systems per frame; 0 = off
 ForceWinMouse=-1    ; mouse buttons fix: -1 auto (on under Wine), 0 off, 1 on
 MouseClipFix=-1     ; mouse-look edge-wall fix: -1 auto, 0 off, 1 on
 MouseMotionFix=-1   ; slow-move stall fix: -1 auto, 0 off, 1 on
-UIScale=0           ; N>1 = UI laid out N x bigger while the ini Resolution
-                    ; stays the render resolution (re-believe, see above);
-                    ; 0/1 = off; -1 not supported on Contracts
+UIScale=0           ; -N (N>1, recommended) = ini Resolution is the UI layout
+                    ; and the backbuffer grows N x; N>1 = legacy re-believe;
+                    ; 0/1 = off; -1 auto is not supported
 UIScalePostFilter=1 ; keep the post-filter under UIScale (default); 0 =
                     ; force PostFilterLOD 0 in memory instead (fallback)
 UIScaleStrict2D=1   ; only rescale true 2D-layer draws (rhw==1, z in 0..1,

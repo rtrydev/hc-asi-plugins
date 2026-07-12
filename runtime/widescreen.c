@@ -125,6 +125,7 @@ static int g_mousemotionfix = -1;   /* feed the DirectInput camera motion from t
 static float g_uiscale_cfg = 0.0f;  /* [display] UIScale: 0/1 off, N>1: UI
                                      * laid out N x bigger; the ini res is
                                      * the render res (see uiscale.c) */
+static unsigned g_uiscale_patchmask = 0x04; /* legacy >1 mode: UI-owned copy */
 static int g_uiscale_postfx = 1;    /* [display] UIScalePostFilter: keep the
                                      * post-filter under UIScale (the loader
                                      * rescales its believed-space UVs);
@@ -136,6 +137,7 @@ static int g_render_w, g_render_h;  /* UIScale>1 re-believed: the
                                      * layout resolution the engine was
                                      * patched to believe. 0 = not
                                      * re-believed */
+static int g_uiscale_grow;          /* UIScale<-1: ini is layout, bb grows */
 static int g_mode_w, g_mode_h;      /* adapter display mode (physical pixels;
                                      * on Retina = 2x the logical desktop) */
 static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
@@ -234,6 +236,9 @@ static void read_config(void)
         else if (sscanf(line, " UIScale = %f", &v) == 1 ||
                  sscanf(line, " UIScale=%f", &v) == 1)
             g_uiscale_cfg = v;
+        else if (sscanf(line, " UIScalePatchMask = %i", &b) == 1 ||
+                 sscanf(line, " UIScalePatchMask=%i", &b) == 1)
+            g_uiscale_patchmask = (unsigned)b;
         else if (sscanf(line, " UIScalePostFilter = %d", &b) == 1 ||
                  sscanf(line, " UIScalePostFilter=%d", &b) == 1)
             g_uiscale_postfx = (b != 0);
@@ -243,9 +248,10 @@ static void read_config(void)
     if (!(g_pf_scale > 0.0f && g_pf_scale < 1.0f)) g_pf_scale = 0.5f;
     if (!(g_fovfactor >= 0.5f && g_fovfactor <= 2.0f)) g_fovfactor = 1.0f;
     if (g_fpscap < 0 || g_fpscap > 1000) g_fpscap = 60;
-    if (g_uiscale_cfg < 0.0f) g_uiscale_cfg = -1.0f;          /* auto */
+    if (g_uiscale_cfg < -8.0f) g_uiscale_cfg = -8.0f;
     else if (g_uiscale_cfg > 8.0f) g_uiscale_cfg = 8.0f;
     hmc_uiscale_config(g_uiscale_cfg);
+    hmc_uiscale_patchmask(g_uiscale_patchmask);
 }
 
 /* Parse "Resolution WxH" from HitmanContracts.ini in the game root (the parent of
@@ -283,6 +289,7 @@ static void read_game_resolution(void)
  * in-game switch changed it) is left alone. */
 static void restore_ini_resolution(void)
 {
+    if (g_uiscale_grow) return; /* ini intentionally remains layout-sized */
     if (!g_render_w || !g_render_h) return;
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%s\\..\\HitmanContracts.ini", g_dir);
@@ -1593,6 +1600,22 @@ static void uiscale_try_rebelieve(void)
     attempted = 1;
     float cfg = hmc_uiscale_cfg();
     if (cfg == 0.0f || cfg == 1.0f) return;
+    if (cfg < -1.0f) {
+        double k = -(double)cfg;
+        int rw = (int)(lround((double)g_ini_w * k / 2.0) * 2);
+        int rh = (int)(lround((double)g_ini_h * k / 2.0) * 2);
+        if (rw < 640 || rh < 400) {
+            logf_("UIScale=%.2f: grown render size %dx%d invalid — off",
+                  (double)cfg, rw, rh);
+            return;
+        }
+        g_render_w = rw; g_render_h = rh;
+        g_uiscale_grow = 1;
+        logf_("UIScale=%.2f: H2-style grow mode — engine/UI layout %dx%d, "
+              "backbuffer %dx%d (engine resolution unchanged)",
+              (double)cfg, g_ini_w, g_ini_h, rw, rh);
+        return;
+    }
     if (cfg < 0.0f) {
         logf_("UIScale=-1 (auto) is not supported on Contracts (the engine "
               "re-reads the real device size) — off; use UIScale=N>1 with "
@@ -1617,12 +1640,6 @@ static void uiscale_try_rebelieve(void)
         logf_("UIScale=%.2f: engine re-believed to layout %dx%d; "
               "HitmanContracts.ini %dx%d stays the render resolution",
               (double)cfg, lw, lh, g_render_w, g_render_h);
-        /* the loader's believed-canvas viewport/RHW/UV rescale keeps the
-         * post-filter coherent under re-believe; UIScalePostFilter=0 is
-         * the fallback that forces PostFilterLOD 0 in memory instead
-         * (re-asserted per frame in frame_limit; an ini edit would not
-         * stick, the engine re-saves the value from its detail setting on
-         * every exit) */
         if (!g_uiscale_postfx)
             hmc_uiscale_force_lod0();
     } else {
@@ -1728,7 +1745,10 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
     /* Arm/disarm the believed-space viewport rescale (uiscale.c) for the
      * layout/render split; k = render/layout. Applies on the exclusive path
      * below too — the backbuffer is the enumerated ini mode either way. */
-    if (g_render_w && g_render_h)
+    if (g_render_w && g_render_h && g_uiscale_grow)
+        hmc_uiscale_setup_viewport(g_ini_w, g_ini_h,
+                                   pp->BackBufferWidth, pp->BackBufferHeight);
+    else if (g_render_w && g_render_h)
         hmc_uiscale_setup(g_ini_w, g_ini_h,
                           pp->BackBufferWidth, pp->BackBufferHeight);
     else

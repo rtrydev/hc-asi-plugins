@@ -58,6 +58,7 @@ static void logf_(const char *fmt, ...)
 
 /* config (set by widescreen.c's parser before the device exists) */
 static float g_cfg_uiscale = 0.0f;    /* 0/1 off, -1 auto, >1 explicit */
+static unsigned g_patch_mask = ~0u;
 
 /* live state (set at CreateDevice/Reset via hmc_uiscale_setup) */
 static int      g_active;
@@ -70,6 +71,8 @@ void hmc_uiscale_config(float uiscale)
 {
     g_cfg_uiscale = uiscale;
 }
+
+void hmc_uiscale_patchmask(unsigned mask) { g_patch_mask = mask; }
 
 float hmc_uiscale_cfg(void) { return g_cfg_uiscale; }
 
@@ -128,6 +131,18 @@ void hmc_uiscale_setup(int ini_w, int ini_h, unsigned bb_w, unsigned bb_h)
           ini_w, ini_h, bb_w, bb_h, g_kx, g_ky);
 }
 
+/* Grow mode needs only believed-space viewport conversion. Keep the loader's
+ * per-draw RHW/UV machinery disarmed by publishing 1/1. */
+void hmc_uiscale_setup_viewport(int ini_w, int ini_h,
+                                unsigned bb_w, unsigned bb_h)
+{
+    hmc_uiscale_setup(ini_w, ini_h, bb_w, bb_h);
+    if (g_active) {
+        publish_to_loader(1.0f, 1.0f);
+        logf_("viewport-only mode — loader RHW/UV scaling disabled");
+    }
+}
+
 /* ---- re-believe: patch the engine's already-parsed resolution ---------
  *
  * The parsed HitmanContracts.ini resolution is findable — an adjacent
@@ -162,7 +177,7 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
     uint8_t *exe = (uint8_t *)GetModuleHandleA(NULL);
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *p = (uint8_t *)0x10000;
-    int ints = 0, floats = 0;
+    int ints = 0, floats = 0, candidates = 0;
     while ((uintptr_t)p < 0x7fff0000u &&
            VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
         uint8_t *base = (uint8_t *)mbi.BaseAddress;
@@ -181,6 +196,8 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                 memcpy(&iv0, q, 4);
                 memcpy(&iv1, q + 4, 4);
                 if (iv0 == ow && iv1 == oh) {
+                    int site = candidates++;
+                    if (!(g_patch_mask & (1u << site))) continue;
                     memcpy(q, &nw, 4);
                     memcpy(q + 4, &nh, 4);
                     if (ints + floats < 8)
@@ -195,6 +212,8 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                     memcpy(&fv0, q, 4);
                     memcpy(&fv1, q + 4, 4);
                     if (fv0 == owf && fv1 == ohf) {
+                        int site = candidates++;
+                        if (!(g_patch_mask & (1u << site))) continue;
                         memcpy(q, &nwf, 4);
                         memcpy(q + 4, &nhf, 4);
                         if (ints + floats < 8)
@@ -210,8 +229,9 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
         }
         p = base + size;
     }
-    logf_("re-believe %dx%d -> %dx%d: %d int + %d float site(s)",
-          rw, rh, lw, lh, ints, floats);
+    logf_("re-believe %dx%d -> %dx%d: %d/%d candidate site(s) patched "
+          "(mask=0x%x; %d int + %d float)", rw, rh, lw, lh,
+          ints + floats, candidates, g_patch_mask, ints, floats);
     return ints + floats;
 }
 

@@ -560,6 +560,9 @@ static void draw(IDirect3DDevice8 *dev)
      * The UI-scale factor keeps the overlay's ON-SCREEN size when the
      * backbuffer is larger than the believed resolution (we draw in real
      * backbuffer pixels). */
+    /* This profiler is part of the Contracts display plugin, so follow the
+     * game's UI magnification. Third-party overlays remain independent: the
+     * loader's public HMC_GetUIScale export intentionally returns 1.0. */
     const float uk = hmc_uiscale_k();
     float cellf = 2.0f * g_scale * uk;
     const float cell = cellf < 1.0f ? 1.0f : floorf(cellf + 0.5f);

@@ -70,6 +70,44 @@ int main(int argc, char **argv){
         got._11, pp.BackBufferWidth, pp.BackBufferHeight,
         (double)pp.BackBufferWidth/pp.BackBufferHeight);
 
+    /* UIScale's fast VB path transforms data inside the engine's existing
+     * write lock. Verify the write -> Unlock -> direct-buffer result without
+     * relying on the game renderer. */
+    typedef void (WINAPI *setuiscale_t)(float, float);
+    setuiscale_t setuiscale = (setuiscale_t)(void*)
+        GetProcAddress(h, "HMC_SetUIScale");
+    IDirect3DVertexBuffer8 *vb = NULL;
+    const DWORD ui_fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+    struct UIVertex { float x,y,z,rhw; DWORD color; float u,v; };
+    hr = dev->lpVtbl->CreateVertexBuffer(dev, 4*sizeof(struct UIVertex),
+        D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY, ui_fvf, D3DPOOL_DEFAULT, &vb);
+    if(!setuiscale || FAILED(hr) || !vb){
+        printf("RESULT: UIScale VB setup FAILED\n"); return 1;
+    }
+    setuiscale(2.0f, 2.0f);
+    dev->lpVtbl->SetVertexShader(dev, ui_fvf);
+    BYTE *mapped = NULL;
+    hr = vb->lpVtbl->Lock(vb, 0, 0, &mapped, D3DLOCK_DISCARD);
+    if(SUCCEEDED(hr) && mapped){
+        struct UIVertex *v = (struct UIVertex*)mapped;
+        for(int i=0;i<4;i++){
+            v[i].x=10.0f+i; v[i].y=20.0f+i; v[i].z=0.0f; v[i].rhw=1.0f;
+            v[i].color=0xffffffff; v[i].u=0.0f; v[i].v=0.0f;
+        }
+        vb->lpVtbl->Unlock(vb);
+        mapped = NULL;
+        hr = vb->lpVtbl->Lock(vb, 0, sizeof(struct UIVertex), &mapped,
+                              D3DLOCK_READONLY);
+    }
+    float scaled_x = mapped ? ((struct UIVertex*)mapped)->x : -1.0f;
+    if(mapped) vb->lpVtbl->Unlock(vb);
+    vb->lpVtbl->Release(vb);
+    setuiscale(1.0f, 1.0f);
+    printf("UIScale VB x 10.0 -> %.1f (expected 20.5)\n", scaled_x);
+    if(scaled_x < 20.49f || scaled_x > 20.51f){
+        printf("RESULT: UIScale VB transform FAILED\n"); return 1;
+    }
+
     /* In-game resolution switch, part 1: Reset to a new backbuffer size (what
      * the engine does when a new mode is picked in the video options). On
      * native D3D8 this is where two historical bugs met: a non-DEFAULT

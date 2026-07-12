@@ -59,6 +59,7 @@
 #define IDX_DEV_SETVSHADER      76
 /* IDirect3DVertexBuffer8: IUnknown(0..2) + IDirect3DResource8(3..10) + Lock(11) */
 #define IDX_VB_LOCK             11
+#define IDX_VB_UNLOCK           12
 
 static FILE *g_log;
 static char g_dir[MAX_PATH];        /* game directory (location of this dll) */
@@ -104,8 +105,6 @@ static int g_in_overlay;        /* inside plugin on_frame draws */
 static void *g_orig_setvshader;
 static void *g_up_scratch;      /* scaled-vertex scratch buffer */
 static size_t g_up_scratch_sz;
-static void *g_idx_scratch;     /* index scratch for redirected VB draws */
-static size_t g_idx_scratch_sz;
 static int g_rhw_logs;
 /* Strict 2D classification of RHW draws before rescaling (default on).
  * The fits-inside-layout-bounds test alone also matches genuine DEVICE-space
@@ -193,11 +192,30 @@ static int g_n_rt_tex;
 static int g_drawstats;               /* HMC_DRAWSTATS=1 enables the probe */
 static void *g_orig_createvb;
 static void *g_orig_vblock;
+static void *g_orig_vbunlock;
 static void *g_orig_drawprim;
 static void *g_orig_drawindexprim;
 static void *g_orig_drawprimup;
 static void *g_orig_drawindexprimup;
 static int g_vb_lock_patched;
+
+/* UIScale writes transformed RHW vertices while the engine already has its
+ * dynamic VB mapped.  Doing this at Unlock avoids the old draw-time READONLY
+ * lock, which serialised D3DMetal, followed by a second Draw*UP upload. */
+#define MAX_TRACKED_VB 256
+typedef struct {
+    IDirect3DVertexBuffer8 *vb;
+    UINT length;
+    DWORD fvf;
+} TrackedVB;
+static TrackedVB g_tracked_vb[MAX_TRACKED_VB];
+static int g_n_tracked_vb;
+static struct {
+    IDirect3DVertexBuffer8 *vb;
+    BYTE *data;
+    UINT off, size;
+    DWORD flags;
+} g_vb_write;
 static LARGE_INTEGER g_qpf;           /* QPC frequency, queried once */
 static LARGE_INTEGER g_last_frame_end;/* QPC at the previous Present return */
 /* per-frame accumulators, folded into the window at each Present */
@@ -333,6 +351,8 @@ static void forget_device_objects(void)
     g_stage0_is_rttex = 0;
     g_stage0_rt_w = g_stage0_rt_h = 0;
     g_stage0_rt_fmt = 0;
+    g_n_tracked_vb = 0;
+    memset(&g_vb_write, 0, sizeof(g_vb_write));
 }
 
 /* Both readers only look at the [display] section of hmc_display.ini (keys
@@ -644,6 +664,8 @@ static void drawsite_top(char *buf, size_t n)
 
 /* ---- draw/lock diagnostic hooks (only patched in when g_drawstats) ---- */
 
+static HRESULT WINAPI hook_VBUnlock(IDirect3DVertexBuffer8 *self);
+
 /* IDirect3DVertexBuffer8::Lock — time the forwarded call and tally DISCARDs.
  * On the D3D->Metal stack a dynamic-VB DISCARD reallocates/flushes per lock
  * (~65us measured previously), so this is where the "A" (lock-churn) cost
@@ -654,12 +676,21 @@ static HRESULT WINAPI hook_VBLock(IDirect3DVertexBuffer8 *self, UINT off,
     typedef HRESULT (WINAPI *lk_t)(IDirect3DVertexBuffer8 *, UINT, UINT,
         BYTE **, DWORD);
     LARGE_INTEGER a, b;
-    QueryPerformanceCounter(&a);
+    if (g_drawstats) QueryPerformanceCounter(&a);
     HRESULT hr = ((lk_t)g_orig_vblock)(self, off, size, ppb, flags);
-    QueryPerformanceCounter(&b);
-    g_f_vblocks++;
-    if (flags & D3DLOCK_DISCARD) g_f_discards++;
-    g_f_lock_ticks += b.QuadPart - a.QuadPart;
+    if (g_drawstats) {
+        QueryPerformanceCounter(&b);
+        g_f_vblocks++;
+        if (flags & D3DLOCK_DISCARD) g_f_discards++;
+        g_f_lock_ticks += b.QuadPart - a.QuadPart;
+    }
+    if (SUCCEEDED(hr) && ppb && *ppb && !(flags & D3DLOCK_READONLY)) {
+        g_vb_write.vb = self;
+        g_vb_write.data = *ppb;
+        g_vb_write.off = off;
+        g_vb_write.size = size;
+        g_vb_write.flags = flags;
+    }
     return hr;
 }
 
@@ -670,10 +701,26 @@ static HRESULT WINAPI hook_CreateVertexBuffer(IDirect3DDevice8 *self,
     typedef HRESULT (WINAPI *cv_t)(IDirect3DDevice8 *, UINT, DWORD, DWORD,
         D3DPOOL, IDirect3DVertexBuffer8 **);
     HRESULT hr = ((cv_t)g_orig_createvb)(self, Length, Usage, FVF, Pool, pp);
-    if (SUCCEEDED(hr) && pp && *pp && !g_vb_lock_patched) {
-        patch_slot(*pp, IDX_VB_LOCK, (void *)hook_VBLock, &g_orig_vblock);
-        g_vb_lock_patched = 1;
-        logf_("DRAWSTATS: VB Lock wrapped (shared vtable) — lock timing live");
+    if (SUCCEEDED(hr) && pp && *pp) {
+        int slot = -1;
+        for (int i = 0; i < g_n_tracked_vb; i++)
+            if (g_tracked_vb[i].vb == *pp) { slot = i; break; }
+        if (slot < 0 && g_n_tracked_vb < MAX_TRACKED_VB)
+            slot = g_n_tracked_vb++;
+        if (slot >= 0) {
+            g_tracked_vb[slot].vb = *pp;
+            g_tracked_vb[slot].length = Length;
+            g_tracked_vb[slot].fvf = FVF;
+        }
+        if (!g_vb_lock_patched) {
+            patch_slot(*pp, IDX_VB_LOCK, (void *)hook_VBLock, &g_orig_vblock);
+            patch_slot(*pp, IDX_VB_UNLOCK, (void *)hook_VBUnlock,
+                       &g_orig_vbunlock);
+            g_vb_lock_patched = 1;
+            logf_("VB Lock/Unlock wrapped (shared vtable) — UIScale transforms "
+                  "dynamic vertices before submission%s",
+                  g_drawstats ? "; draw timing live" : "");
+        }
     }
     return hr;
 }
@@ -966,6 +1013,52 @@ static void rhw_scale_log(UINT stride, UINT count, int do_pos, UINT uv_off,
           base ? (uint8_t *)ret - base : 0);
 }
 
+/* Transform a dynamic VB while it is still mapped by the engine.  The old
+ * implementation reopened the buffer READONLY from each DrawPrimitive,
+ * forcing a GPU/CPU synchronisation on D3DMetal, copied it to scratch, then
+ * uploaded it again through DrawPrimitiveUP.  Contracts fills its immediate
+ * RHW buffers immediately before submission, so Unlock is the safe and cheap
+ * point to do the same arithmetic in place. */
+static HRESULT WINAPI hook_VBUnlock(IDirect3DVertexBuffer8 *self)
+{
+    typedef HRESULT (WINAPI *un_t)(IDirect3DVertexBuffer8 *);
+    if (g_vb_write.vb == self && g_vb_write.data) {
+        TrackedVB *m = NULL;
+        for (int i = 0; i < g_n_tracked_vb; i++)
+            if (g_tracked_vb[i].vb == self) { m = &g_tracked_vb[i]; break; }
+        if (m) {
+            DWORD fvf = m->fvf ? m->fvf : g_cur_fvf;
+            DWORD saved_fvf = g_cur_fvf;
+            g_cur_fvf = fvf;
+            int do_pos; UINT uv_off;
+            int wanted = uiscale_rhw_wanted(&do_pos, &uv_off);
+            UINT stride = fvf_rhw_vertex_size(fvf);
+            UINT bytes = g_vb_write.size;
+            if (!bytes && g_vb_write.off < m->length)
+                bytes = m->length - g_vb_write.off;
+            if (wanted &&
+                (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW &&
+                stride >= 16 && bytes >= stride && bytes % stride == 0) {
+                UINT count = bytes / stride;
+                if (!rhw_verts_layout_2d(g_vb_write.data, stride, 0, count)) {
+                    do_pos = 0;
+                    if (g_uiscale_strict2d) uv_off = 0;
+                }
+                if (do_pos || uv_off) {
+                    scale_rhw_verts(g_vb_write.data, stride, 0, count,
+                                    do_pos, uv_off);
+                    rhw_scale_log(stride, count, do_pos, uv_off,
+                                  "VB-write", __builtin_return_address(0));
+                }
+            }
+            g_cur_fvf = saved_fvf;
+        }
+    }
+    g_vb_write.vb = NULL;
+    g_vb_write.data = NULL;
+    return ((un_t)g_orig_vbunlock)(self);
+}
+
 /* Copy `total` vertices to the scratch buffer and rescale positions and/or
  * texture set 0 of vertices [first, first+count). Returns the scratch, or
  * NULL (draw unmodified) on any doubt. */
@@ -993,180 +1086,10 @@ static const void *uiscale_scale_rhw(const void *data, UINT stride,
     return g_up_scratch;
 }
 
-/* Diagnostic: a believed-space RHW vertex-buffer draw the redirect below
- * could not handle (lock failure etc.) — log once so it is visible. */
-static void uiscale_rhw_vb_diag(void *ret)
-{
-    static int logged;
-    int do_pos; UINT uv_off;
-    if (logged || !uiscale_rhw_wanted(&do_pos, &uv_off)) return;
-    logged = 1;
-    uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
-    logf_("UIScale: WARNING — RHW draw from a vertex buffer at exe+0x%tx "
-          "is NOT rescaled (redirect failed)",
-          base ? (uint8_t *)ret - base : 0);
-}
-
-/* The engine's 2D layer submits its believed-space RHW quads from vertex
- * buffers (DrawPrimitive/DrawIndexedPrimitive), which cannot be edited in
- * flight. Redirect: read the drawn vertex (and index) range out of the
- * bound buffers, scale x/y on a scratch copy, submit through the UP
- * entrypoints (via timed_draw, so the postfx alpha fix still wraps the
- * composite), then restore the stream-0/index bindings the UP draw
- * clobbers. Returns 1 with *out set when handled; 0 = draw normally. */
-typedef HRESULT (WINAPI *gss_t)(IDirect3DDevice8 *, UINT,
-    IDirect3DVertexBuffer8 **, UINT *);
-typedef HRESULT (WINAPI *sss_t)(IDirect3DDevice8 *, UINT,
-    IDirect3DVertexBuffer8 *, UINT);
-typedef HRESULT (WINAPI *gidx_t)(IDirect3DDevice8 *, IDirect3DIndexBuffer8 **,
-    UINT *);
-typedef HRESULT (WINAPI *sidx_t)(IDirect3DDevice8 *, IDirect3DIndexBuffer8 *,
-    UINT);
-typedef HRESULT (WINAPI *buflock_t)(void *, UINT, UINT, BYTE **, DWORD);
-typedef HRESULT (WINAPI *bufunlock_t)(void *);
-#define BUF_LOCK(b)   ((buflock_t)(*(void ***)(b))[11])
-#define BUF_UNLOCK(b) ((bufunlock_t)(*(void ***)(b))[12])
-#define DEVFN(d, i, ty) ((ty)(*(void ***)(d))[i])
-
-/* Lock a byte range of a VB/IB for reading. READONLY first; a WRITEONLY
- * buffer can reject that on native D3D8, so retry with no flags (wined3d
- * keeps these sysmem-backed either way). */
-static BYTE *buf_lock_read(void *buf, UINT off, UINT size)
-{
-    BYTE *p = NULL;
-    if (SUCCEEDED(BUF_LOCK(buf)(buf, off, size, &p, D3DLOCK_READONLY)) && p)
-        return p;
-    p = NULL;
-    if (SUCCEEDED(BUF_LOCK(buf)(buf, off, size, &p, 0)) && p)
-        return p;
-    return NULL;
-}
-
-static int uiscale_vb_draw_scaled(IDirect3DDevice8 *self, D3DPRIMITIVETYPE t,
-    UINT start, UINT primcount, int do_pos, UINT uv_off, void *ret,
-    HRESULT *out)
-{
-    UINT vcount = prim_vertex_count(t, primcount);
-    IDirect3DVertexBuffer8 *vb = NULL;
-    UINT stride = 0;
-    if (!vcount) return 0;
-    if (FAILED(DEVFN(self, 84, gss_t)(self, 0, &vb, &stride)) || !vb)
-        return 0;
-    int ok = 0, locked = 0;
-    BYTE *src = NULL;
-    if (stride >= 16 && (!uv_off || uv_off + 8 <= stride) &&
-        scratch_ensure(&g_up_scratch, &g_up_scratch_sz,
-                       (size_t)vcount * stride) &&
-        (src = buf_lock_read(vb, start * stride, vcount * stride)) != NULL) {
-        memcpy(g_up_scratch, src, (size_t)vcount * stride);
-        BUF_UNLOCK(vb)(vb);
-        locked = 1;
-        if (!rhw_verts_layout_2d(g_up_scratch, stride, 0, vcount)) {
-            do_pos = 0;   /* not the 2D layer: leave the draw alone */
-            if (g_uiscale_strict2d) uv_off = 0;
-        }
-        if (do_pos || uv_off) {
-            scale_rhw_verts(g_up_scratch, stride, 0, vcount, do_pos, uv_off);
-            rhw_scale_log(stride, vcount, do_pos, uv_off, "VB", ret);
-            DrawCtx c = {0};
-            c.self = self; c.t = t; c.a = primcount;
-            c.p = g_up_scratch; c.stride = stride;
-            *out = timed_draw(self, ret, call_DrawPrimitiveUP, &c, 0);
-            /* the UP draw cleared the stream-0 binding; put the engine's
-             * back */
-            DEVFN(self, 83, sss_t)(self, 0, vb, stride);
-            ok = 1;
-        }
-    }
-    release_iunknown(vb);   /* GetStreamSource AddRef'd it */
-    if (!ok && !locked)
-        uiscale_rhw_vb_diag((void *)ret);   /* lock/alloc failed */
-    return ok;
-}
-
-static int uiscale_vb_idraw_scaled(IDirect3DDevice8 *self,
-    D3DPRIMITIVETYPE t, UINT minV, UINT numV, UINT startIdx, UINT primcount,
-    int do_pos, UINT uv_off, void *ret, HRESULT *out)
-{
-    UINT idxcount = prim_vertex_count(t, primcount);
-    if (!idxcount || !numV) return 0;
-    IDirect3DVertexBuffer8 *vb = NULL;
-    IDirect3DIndexBuffer8 *ib = NULL;
-    UINT stride = 0, base = 0;
-    if (FAILED(DEVFN(self, 84, gss_t)(self, 0, &vb, &stride)) || !vb)
-        return 0;
-    if (FAILED(DEVFN(self, 86, gidx_t)(self, &ib, &base)) || !ib) {
-        release_iunknown(vb);
-        return 0;
-    }
-    D3DINDEXBUFFER_DESC id;
-    typedef HRESULT (WINAPI *ibdesc_t)(void *, D3DINDEXBUFFER_DESC *);
-    int ok = 0, locked = 0;
-    if (SUCCEEDED(((ibdesc_t)(*(void ***)ib)[13])(ib, &id)) &&
-        (id.Format == D3DFMT_INDEX16 || id.Format == D3DFMT_INDEX32) &&
-        stride >= 16 && (!uv_off || uv_off + 8 <= stride)) {
-        UINT isz = id.Format == D3DFMT_INDEX16 ? 2 : 4;
-        /* scratch vertex array addressed by the UNCHANGED index values:
-         * scratch[i] (i in [minV, minV+numV)) = vb[(base+i)]; the head
-         * below minV is never fetched */
-        size_t vneed = (size_t)(minV + numV) * stride;
-        BYTE *vsrc = NULL, *isrc = NULL;
-        if (scratch_ensure(&g_up_scratch, &g_up_scratch_sz, vneed) &&
-            scratch_ensure(&g_idx_scratch, &g_idx_scratch_sz,
-                           (size_t)idxcount * isz) &&
-            (vsrc = buf_lock_read(vb, (base + minV) * stride,
-                                  numV * stride)) != NULL) {
-            if ((isrc = buf_lock_read(ib, startIdx * isz,
-                                      idxcount * isz)) != NULL) {
-                memcpy((uint8_t *)g_up_scratch + (size_t)minV * stride,
-                       vsrc, (size_t)numV * stride);
-                memcpy(g_idx_scratch, isrc, (size_t)idxcount * isz);
-                BUF_UNLOCK(ib)(ib);
-                BUF_UNLOCK(vb)(vb);
-                locked = 1;
-                if (!rhw_verts_layout_2d(g_up_scratch, stride, minV, numV)) {
-                    do_pos = 0;   /* not the 2D layer: leave the draw alone */
-                    if (g_uiscale_strict2d) uv_off = 0;
-                }
-                if (do_pos || uv_off) {
-                    scale_rhw_verts(g_up_scratch, stride, minV, numV,
-                                    do_pos, uv_off);
-                    rhw_scale_log(stride, numV, do_pos, uv_off,
-                                  "VB-indexed", ret);
-                    DrawCtx c = {0};
-                    c.self = self; c.t = t; c.a = minV; c.b = numV;
-                    c.c = primcount; c.p = g_idx_scratch; c.q = g_up_scratch;
-                    c.fmt = id.Format; c.stride = stride;
-                    *out = timed_draw(self, ret, call_DrawIndexedPrimitiveUP,
-                                      &c, 0);
-                    /* restore the bindings the UP draw clobbered */
-                    DEVFN(self, 83, sss_t)(self, 0, vb, stride);
-                    DEVFN(self, 85, sidx_t)(self, ib, base);
-                    ok = 1;
-                }
-            } else {
-                BUF_UNLOCK(vb)(vb);
-            }
-        }
-    }
-    release_iunknown(ib);
-    release_iunknown(vb);
-    if (!ok && !locked)
-        uiscale_rhw_vb_diag((void *)ret);   /* lock/alloc failed */
-    return ok;
-}
-
 static HRESULT WINAPI hook_DrawPrimitive(IDirect3DDevice8 *self,
     D3DPRIMITIVETYPE t, UINT start, UINT count)
 {
     void *ret = __builtin_return_address(0);
-    int do_pos; UINT uv_off;
-    if (uiscale_rhw_wanted(&do_pos, &uv_off)) {
-        HRESULT hr;
-        if (uiscale_vb_draw_scaled(self, t, start, count, do_pos, uv_off,
-                                   ret, &hr))
-            return hr;
-    }
     DrawCtx c = {0};
     c.self = self; c.t = t; c.a = start; c.b = count;
     return timed_draw(self, ret, call_DrawPrimitive, &c, 0);
@@ -1176,13 +1099,6 @@ static HRESULT WINAPI hook_DrawIndexedPrimitive(IDirect3DDevice8 *self,
     D3DPRIMITIVETYPE t, UINT minIdx, UINT numV, UINT startIdx, UINT count)
 {
     void *ret = __builtin_return_address(0);
-    int do_pos; UINT uv_off;
-    if (uiscale_rhw_wanted(&do_pos, &uv_off)) {
-        HRESULT hr;
-        if (uiscale_vb_idraw_scaled(self, t, minIdx, numV, startIdx, count,
-                                    do_pos, uv_off, ret, &hr))
-            return hr;
-    }
     DrawCtx c = {0};
     c.self = self; c.t = t; c.a = minIdx; c.b = numV;
     c.c = startIdx; c.d = count;
@@ -1700,10 +1616,10 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
             logf_("PostFilterAlphaFix: armed (RT texture -> backbuffer "
                   "SRCALPHA composites use ONE)");
         }
-        if (g_drawstats) {
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CREATEVB,
-                       (void *)hook_CreateVertexBuffer, &g_orig_createvb);
-        }
+        /* Track the engine's dynamic VBs so UIScale can transform RHW data
+         * in its existing write lock, without draw-time readback/upload. */
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CREATEVB,
+                   (void *)hook_CreateVertexBuffer, &g_orig_createvb);
         /* Draw entrypoints are always wrapped: DRAWSTATS and the postfx
          * alpha fix use them opportunistically, and the UIScale RHW rescale
          * needs them (plus the current FVF) whenever it is active. */
@@ -2026,7 +1942,9 @@ __declspec(dllexport) void WINAPI HMC_SetUIScale(float kx, float ky)
 
 __declspec(dllexport) float WINAPI HMC_GetUIScale(void)
 {
-    return g_uiscale_ky;
+    /* Plugin overlays draw in real backbuffer pixels and own their sizing.
+     * Do not couple their configured scale to the game's UI magnification. */
+    return 1.0f;
 }
 
 /* ---- ASI loading ----------------------------------------------------- */
