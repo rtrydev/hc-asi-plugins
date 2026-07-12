@@ -107,6 +107,17 @@ static size_t g_up_scratch_sz;
 static void *g_idx_scratch;     /* index scratch for redirected VB draws */
 static size_t g_idx_scratch_sz;
 static int g_rhw_logs;
+/* Strict 2D classification of RHW draws before rescaling (default on).
+ * The fits-inside-layout-bounds test alone also matches genuine DEVICE-space
+ * draws that happen to lie within the layout rect — e.g. software-projected
+ * world geometry (rhw = 1/w) or effect quads in the top-left region — and
+ * scaling those corrupts the scene, including the destination-alpha channel
+ * the ground detail-texture blending reads (the "invisible/flat textures in
+ * the old spots" regression). The engine's believed-space 2D layer emits
+ * pre-transformed quads with rhw exactly 1 and z in [0,1], and its vertex
+ * stride equals the FVF's size — so draws failing any of those checks are
+ * left untouched. UIScaleStrict2D=0 restores the bounds-only behaviour. */
+static int g_uiscale_strict2d = 1;
 
 /* Post-filter alpha repair. On the CrossOver D3D->Metal stack the A8
  * render-target alpha that fixes Contracts's ground/detail blending also
@@ -768,9 +779,32 @@ static UINT fvf_uv0_offset(DWORD fvf)
     if (((fvf >> D3DFVF_TEXCOUNT_SHIFT) & 0xF) == 0) return 0;
     if (((fvf >> 16) & 3) != 0) return 0;   /* set 0 not 2D */
     UINT off = 16;
+    if (fvf & D3DFVF_PSIZE)    off += 4;
     if (fvf & D3DFVF_DIFFUSE)  off += 4;
     if (fvf & D3DFVF_SPECULAR) off += 4;
     return off;
+}
+
+/* Vertex size an XYZRHW FVF implies. A stream whose stride differs is NOT
+ * described by the tracked FVF (SetVertexShader is a persistent latch and
+ * can be bypassed by state blocks) — rescaling such a draw would read and
+ * write the wrong vertex fields. */
+static UINT fvf_rhw_vertex_size(DWORD fvf)
+{
+    UINT sz = 16;                          /* x, y, z, rhw */
+    if (fvf & D3DFVF_PSIZE)    sz += 4;
+    if (fvf & D3DFVF_DIFFUSE)  sz += 4;
+    if (fvf & D3DFVF_SPECULAR) sz += 4;
+    UINT n = (fvf >> D3DFVF_TEXCOUNT_SHIFT) & 0xF;
+    for (UINT i = 0; i < n; i++) {
+        switch ((fvf >> (16 + 2 * i)) & 3) {
+        case 0: sz += 8;  break;           /* 2D (TEXTUREFORMAT2) */
+        case 1: sz += 12; break;           /* 3D */
+        case 2: sz += 16; break;           /* 4D */
+        case 3: sz += 4;  break;           /* 1D */
+        }
+    }
+    return sz;
 }
 
 /* What (if anything) must be rescaled on this RHW draw?
@@ -854,28 +888,63 @@ static void scale_rhw_verts(void *verts, UINT stride, UINT first, UINT count,
     }
 }
 
-/* Is this vertex range believed-(layout-)space? The engine's 2D layer emits
- * coordinates within the layout resolution (backbuffer / k); a few RHW
- * emitters size their quads from the REAL display instead — the intro-video
- * player reads the display mode, which is deliberately not patched — and
- * scaling those again pushes them off-screen. Coordinates already past the
- * layout bounds mean device space: leave the draw alone. */
-static int rhw_verts_in_layout(const void *verts, UINT stride, UINT first,
+/* Is this vertex range a believed-(layout-)space 2D emission? Only those may
+ * be rescaled; everything else is left alone:
+ *  - coordinates past the layout bounds are DEVICE space — a few RHW
+ *    emitters size their quads from the REAL display (the intro-video
+ *    player reads the display mode, which is deliberately not patched), and
+ *    scaling those again pushes them off-screen;
+ *  - (strict, default) vertices whose rhw is not exactly ~1 or whose z is
+ *    outside [0,1] are not the engine's pre-transformed 2D layer — they are
+ *    software-PROJECTED geometry (rhw = 1/w) that merely happens to lie
+ *    within the layout rect on screen. Scaling those displaces scene draws
+ *    and corrupts the canvas (and its destination alpha — the ground
+ *    detail-blend regression);
+ *  - (strict, default) a stream stride different from the tracked FVF's
+ *    vertex size means the FVF latch is stale for this draw: the position
+ *    and UV offsets would read/write the wrong fields. */
+static int rhw_verts_layout_2d(const void *verts, UINT stride, UINT first,
                                UINT count)
 {
     float lw = (float)g_bbw / g_uiscale_kx + 2.0f;
     float lh = (float)g_bbh / g_uiscale_ky + 2.0f;
+    if (g_uiscale_strict2d) {
+        UINT want = fvf_rhw_vertex_size(g_cur_fvf);
+        if (stride != want) {
+            static int logged;
+            if (!logged) {
+                logged = 1;
+                logf_("UIScale: RHW draw left unscaled (stride %u != %u "
+                      "implied by fvf 0x%lx — stale FVF latch?)", stride,
+                      want, (unsigned long)g_cur_fvf);
+            }
+            return 0;
+        }
+    }
     const uint8_t *v = (const uint8_t *)verts + (size_t)first * stride;
     for (UINT i = 0; i < count; i++, v += stride) {
-        float xy[2];
-        memcpy(xy, v, 8);
-        if (xy[0] > lw || xy[1] > lh) {
+        float p[4];
+        memcpy(p, v, 16);
+        if (p[0] > lw || p[1] > lh) {
             static int logged;
             if (!logged) {
                 logged = 1;
                 logf_("UIScale: device-space RHW draw left unscaled "
                       "(x=%.1f y=%.1f > layout %.0fx%.0f — e.g. the video "
-                      "player)", xy[0], xy[1], (double)lw, (double)lh);
+                      "player)", p[0], p[1], (double)lw, (double)lh);
+            }
+            return 0;
+        }
+        if (g_uiscale_strict2d &&
+            !(p[2] >= -0.001f && p[2] <= 1.001f &&
+              p[3] >= 0.999f && p[3] <= 1.001f)) {   /* NaN fails too */
+            static int logged;
+            if (!logged) {
+                logged = 1;
+                logf_("UIScale: projected RHW draw left unscaled "
+                      "(z=%.4f rhw=%.4f is not the 2D layer; "
+                      "UIScaleStrict2D=0 restores the old behaviour)",
+                      p[2], p[3]);
             }
             return 0;
         }
@@ -909,8 +978,13 @@ static const void *uiscale_scale_rhw(const void *data, UINT stride,
     size_t need = (size_t)total * stride;
     if (!scratch_ensure(&g_up_scratch, &g_up_scratch_sz, need))
         return NULL;
-    if (do_pos && !rhw_verts_in_layout(data, stride, first, count))
-        do_pos = 0;   /* device-space positions: leave them */
+    if (!rhw_verts_layout_2d(data, stride, first, count)) {
+        /* not the believed-space 2D layer: leave the positions alone, and
+         * (strict) the UVs too — a device-coherent draw's UVs are already
+         * right, and scale+clamp would corrupt partial-range ones */
+        do_pos = 0;
+        if (g_uiscale_strict2d) uv_off = 0;
+    }
     if (!do_pos && !uv_off)
         return NULL;
     memcpy(g_up_scratch, data, need);
@@ -987,8 +1061,10 @@ static int uiscale_vb_draw_scaled(IDirect3DDevice8 *self, D3DPRIMITIVETYPE t,
         memcpy(g_up_scratch, src, (size_t)vcount * stride);
         BUF_UNLOCK(vb)(vb);
         locked = 1;
-        if (do_pos && !rhw_verts_in_layout(g_up_scratch, stride, 0, vcount))
-            do_pos = 0;   /* device-space positions: leave them */
+        if (!rhw_verts_layout_2d(g_up_scratch, stride, 0, vcount)) {
+            do_pos = 0;   /* not the 2D layer: leave the draw alone */
+            if (g_uiscale_strict2d) uv_off = 0;
+        }
         if (do_pos || uv_off) {
             scale_rhw_verts(g_up_scratch, stride, 0, vcount, do_pos, uv_off);
             rhw_scale_log(stride, vcount, do_pos, uv_off, "VB", ret);
@@ -1048,9 +1124,10 @@ static int uiscale_vb_idraw_scaled(IDirect3DDevice8 *self,
                 BUF_UNLOCK(ib)(ib);
                 BUF_UNLOCK(vb)(vb);
                 locked = 1;
-                if (do_pos &&
-                    !rhw_verts_in_layout(g_up_scratch, stride, minV, numV))
-                    do_pos = 0;   /* device-space positions: leave them */
+                if (!rhw_verts_layout_2d(g_up_scratch, stride, minV, numV)) {
+                    do_pos = 0;   /* not the 2D layer: leave the draw alone */
+                    if (g_uiscale_strict2d) uv_off = 0;
+                }
                 if (do_pos || uv_off) {
                     scale_rhw_verts(g_up_scratch, stride, minV, numV,
                                     do_pos, uv_off);
@@ -2044,6 +2121,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
                   pfox_ini ? "hmc_display.ini" : "HMC_POSTFX_OPAQUE_RT=1",
                   g_postfx_opaque_mask);
         }
+        g_uiscale_strict2d = read_int_ini("UIScaleStrict2D", 1) != 0;
+        if (!g_uiscale_strict2d)
+            logf_("UIScaleStrict2D disabled: RHW draws are classified by "
+                  "layout bounds alone (pre-1.5 behaviour)");
         memset(v, 0, sizeof(v));
         int rain_env = GetEnvironmentVariableA("HMC_RAIN_EMIT_CAP", v,
                                                sizeof(v)) ? atoi(v) : 0;

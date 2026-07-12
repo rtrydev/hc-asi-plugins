@@ -309,6 +309,22 @@ void hmc_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned bbw, unsigned bbh)
     if (x1 > g_bb_w) x1 = g_bb_w;
     if (y1 > g_bb_h) y1 = g_bb_h;
     if (x1 <= x0 || y1 <= y0) return;
+    /* Diagnostic: a scaled viewport that is NOT the full layout rect. The
+     * fits-within-layout gate cannot distinguish a layout-space sub-rect
+     * (must scale) from a small device-derived sub-view on a full-size
+     * canvas (mirror/scope — must not); if such a sub-view ever misrenders,
+     * these lines identify the viewport to gate on. */
+    if (vp->X || vp->Y ||
+        vp->Width + 2 < (DWORD)g_ini_w || vp->Height + 2 < (DWORD)g_ini_h) {
+        static int sub_logs;
+        if (sub_logs < 8) {
+            sub_logs++;
+            logf_("viewport SUB-RECT scaled: %lux%lu at %lu,%lu (layout "
+                  "%dx%d)", (unsigned long)vp->Width,
+                  (unsigned long)vp->Height, (unsigned long)vp->X,
+                  (unsigned long)vp->Y, g_ini_w, g_ini_h);
+        }
+    }
     if (g_vp_logs < 8) {
         g_vp_logs++;
         logf_("viewport %lux%lu at %lu,%lu -> %lux%lu at %lu,%lu",

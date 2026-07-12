@@ -341,7 +341,21 @@ sample those full-size RTs (the engine computes them as layout-derived
 sub-rects; the content now fills the RT, so the UVs follow — full-range
 0..1 blits are unaffected by the scale-and-clamp). Device-space geometry
 (e.g. the video player's quads) is detected by its coordinates and left
-alone. If the post path ever misbehaves, `UIScalePostFilter=0` is the
+alone.
+
+Only the engine's believed-space **2D layer** may be rescaled. That layer
+emits pre-transformed quads with `rhw` exactly 1 and `z` in 0..1, and its
+vertex stride matches the tracked FVF — any RHW draw failing those checks
+(e.g. software-projected world geometry, whose on-screen coordinates can
+also happen to fit inside the layout rect) is left untouched. Without this
+gate such scene draws were displaced/corrupted — including the canvas's
+destination-alpha channel, which brought the "invisible/flat ground
+textures" of the old X8-backbuffer bug back in the same spots. Skipped
+draws log one-shot `UIScale: ... left unscaled` lines; `UIScaleStrict2D=0`
+restores the old bounds-only classification if a UI element ever stops
+scaling.
+
+If the post path ever misbehaves, `UIScalePostFilter=0` is the
 fallback: it forces the engine's parsed `PostFilterLOD` to 0 in memory
 (re-asserted every frame — an ini edit would not stick, the engine re-saves
 that value from its detail setting on every exit), rendering the scene
@@ -390,6 +404,8 @@ UIScale=0           ; N>1 = UI laid out N x bigger while the ini Resolution
                     ; 0/1 = off; -1 not supported on Contracts
 UIScalePostFilter=1 ; keep the post-filter under UIScale (default); 0 =
                     ; force PostFilterLOD 0 in memory instead (fallback)
+UIScaleStrict2D=1   ; only rescale true 2D-layer draws (rhw==1, z in 0..1,
+                    ; stride matching the FVF); 0 = old bounds-only test
 ```
 
 Install output: loader `d3d8.dll` (game root); `scripts/hmc_display.asi` +
