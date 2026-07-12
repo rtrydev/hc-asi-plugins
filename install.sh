@@ -74,9 +74,18 @@ if [ ! -f "$GAME/scripts/hmc_display.ini" ]; then
         # ShowCPU=0 by default: the CPU-share breakdown suspends the game's
         # main thread to sample it, which costs frame time — set ShowCPU=1
         # only when you want the X87/GAME/REST diagnostic.
-        printf '[display]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n\n[profiler]\nEnabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n' \
+        printf '[display]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=0\nUIScalePostFilter=1\n\n[profiler]\nEnabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n' \
             > "$GAME/scripts/hmc_display.ini"
     fi
+fi
+if ! grep -q '^[[:space:]]*UIScale' "$GAME/scripts/hmc_display.ini"; then
+    # surface the UIScale key, off by default: N>1 lays the UI out N x
+    # bigger while the HitmanContracts.ini Resolution stays the render
+    # resolution (see README / runtime/uiscale.c)
+    awk '{ print } /^\[display\]/ || /^\[widescreen\]/ { print "UIScale=0" }' \
+        "$GAME/scripts/hmc_display.ini" > "$GAME/scripts/hmc_display.ini.tmp" \
+        && mv "$GAME/scripts/hmc_display.ini.tmp" "$GAME/scripts/hmc_display.ini"
+    echo "hmc_display.ini: added UIScale=0 to [display]"
 fi
 rm -f "$GAME/scripts/HMCWidescreen.ini" "$GAME/scripts/HMCProfiler.ini"
 
@@ -144,7 +153,9 @@ if [ -f "$INI" ]; then
 
     # The full-res post-filter patch (PostFilterFullRes=1) needs the game's own
     # post-filter enabled, i.e. PostFilterLOD >= 1 (the stock default is 1). If a
-    # previous run set it to 0, restore 1 so the graded/bloom pass runs.
+    # previous run set it to 0, restore 1 so the graded/bloom pass runs. (The
+    # post-filter also runs under UIScale: the loader rescales its
+    # believed-space viewports/quads/UVs; UIScalePostFilter=0 is the opt-out.)
     if grep -qiE '^[[:space:]]*PostFilterLOD[[:space:]]+0' "$INI"; then
         sed "s/^[[:space:]]*[Pp]ostFilterLOD[[:space:]].*/PostFilterLOD 1/" "$INI" > "$INI.tmp" \
             && mv "$INI.tmp" "$INI"

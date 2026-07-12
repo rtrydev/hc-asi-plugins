@@ -23,7 +23,7 @@
 
 #include <d3d8.h>
 
-#define HMC_D3D8_HOOKS_VERSION 3
+#define HMC_D3D8_HOOKS_VERSION 4
 
 typedef struct HMCD3D8Hooks {
     unsigned int version;   /* set to HMC_D3D8_HOOKS_VERSION */
@@ -60,12 +60,33 @@ typedef struct HMCD3D8Hooks {
      * already shown). The scene has ended by this point; a plugin that draws
      * must save/restore device state around its own draw calls. */
     void (*on_frame)(IDirect3DDevice8 *dev);
+
+    /* ---- version 4 fields (absent in v3 registrations; the loader
+     * zero-fills them for a v3 plugin) ---- */
+
+    /* Optional (may be NULL): called for every IDirect3DDevice8::SetViewport
+     * on a private copy the loader then forwards (before the loader's own
+     * garbage-viewport clamp). Used by the UI-scale feature: the engine sets
+     * viewports in its believed (HitmanContracts.ini) resolution while the
+     * backbuffer is larger, so the plugin rescales them here. bbw/bbh are the
+     * live backbuffer size. */
+    void (*fix_viewport)(D3DVIEWPORT8 *vp, unsigned int bbw, unsigned int bbh);
 } HMCD3D8Hooks;
 
 /* Multiple plugins may register; the loader keeps every hook set and invokes
  * each non-NULL callback in registration order. fix_present / fix_projection
- * are applied in turn (each sees the previous plugin's edits). */
+ * are applied in turn (each sees the previous plugin's edits). Registration
+ * accepts version 3 structs too (the v4 tail is zero-filled). */
 
 typedef void (WINAPI *hmc_register_fn)(const HMCD3D8Hooks *hooks);
+
+/* The loader also exports:
+ *   void  WINAPI HMC_SetUIScale(float kx, float ky);  // set by hmc_display
+ *   float WINAPI HMC_GetUIScale(void);                // ky; 1.0 when off
+ * kx/ky are the backbuffer/believed-resolution ratios of the experimental
+ * (off-by-default, currently broken — see uiscale.c) UIScale feature.
+ * Overlay plugins that draw in real backbuffer pixels multiply their glyph
+ * sizes by HMC_GetUIScale() so their text keeps its configured on-screen
+ * size when the feature is active. */
 
 #endif /* HMC_D3D8_H */

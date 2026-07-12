@@ -70,6 +70,14 @@
  *   MouseMotionFix=-1 ; fix the slow-move camera stall by feeding camera motion
  *                   ; from the OS cursor instead of DirectInput's lossy relative
  *                   ; axis (buttons stay on DI): -1 auto (Wine), 0 off, 1 on
+ *   UIScale=0       ; N>1: the HitmanContracts.ini Resolution stays the
+ *                   ; RENDER resolution and the UI is laid out N x bigger —
+ *                   ; the engine's parsed copy of the resolution is patched
+ *                   ; in memory to Resolution/N at the first CreateDevice
+ *                   ; (see uiscale.c). 0/1 = off (default). -1 (H2SA's
+ *                   ; grow-the-backbuffer auto mode) is not supported on
+ *                   ; Contracts: this engine re-reads the real device size,
+ *                   ; so that decoupling renders the UI at two scales.
  */
 #include <d3d8.h>
 #include <stdio.h>
@@ -114,6 +122,22 @@ static int g_mousemotionfix = -1;   /* feed the DirectInput camera motion from t
                                      * OS cursor (which tracks slow movement under
                                      * winemac) instead of DI's lossy relative
                                      * axis: -1 auto (Wine), 0 off, 1 always */
+static float g_uiscale_cfg = 0.0f;  /* [display] UIScale: 0/1 off, N>1: UI
+                                     * laid out N x bigger; the ini res is
+                                     * the render res (see uiscale.c) */
+static int g_uiscale_postfx = 1;    /* [display] UIScalePostFilter: keep the
+                                     * post-filter under UIScale (the loader
+                                     * rescales its believed-space UVs);
+                                     * 0 = force PostFilterLOD 0 in memory
+                                     * (fallback if the post path breaks) */
+static int g_render_w, g_render_h;  /* UIScale>1 re-believed: the
+                                     * HitmanContracts.ini (render)
+                                     * resolution; g_ini_w/h then hold the
+                                     * layout resolution the engine was
+                                     * patched to believe. 0 = not
+                                     * re-believed */
+static int g_mode_w, g_mode_h;      /* adapter display mode (physical pixels;
+                                     * on Retina = 2x the logical desktop) */
 static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
 static D3DFORMAT g_desktop_fmt = D3DFMT_X8R8G8B8; /* desktop backbuffer format */
 static int g_caps_done;             /* caps queried yet? */
@@ -127,6 +151,10 @@ static int g_cursorfix = 0;        /* 0 off (default), 1 on, -1 auto (Wine).
                                     * re-prime + SetCursorPos churn made camera
                                     * movement feel heavy — net negative. */
 static HWND g_game_hwnd;           /* the game window, learned at device init */
+
+/* uiscale.c hook (D3D-typed, so declared here rather than hmc_plugin.h) */
+void hmc_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned int bbw,
+                              unsigned int bbh);
 static volatile DWORD g_fg_deadline; /* startup-activation window still open */
 static volatile DWORD g_next_kick;   /* earliest tick for the next kick */
 static volatile int g_kicks_left;    /* remaining startup activation kicks */
@@ -203,12 +231,21 @@ static void read_config(void)
         else if (sscanf(line, " MouseMotionFix = %d", &b) == 1 ||
                  sscanf(line, " MouseMotionFix=%d", &b) == 1)
             g_mousemotionfix = b < 0 ? -1 : (b != 0);
+        else if (sscanf(line, " UIScale = %f", &v) == 1 ||
+                 sscanf(line, " UIScale=%f", &v) == 1)
+            g_uiscale_cfg = v;
+        else if (sscanf(line, " UIScalePostFilter = %d", &b) == 1 ||
+                 sscanf(line, " UIScalePostFilter=%d", &b) == 1)
+            g_uiscale_postfx = (b != 0);
     }
     fclose(f);
     if (g_backbuffers < 0 || g_backbuffers > 3) g_backbuffers = 2;
     if (!(g_pf_scale > 0.0f && g_pf_scale < 1.0f)) g_pf_scale = 0.5f;
     if (!(g_fovfactor >= 0.5f && g_fovfactor <= 2.0f)) g_fovfactor = 1.0f;
     if (g_fpscap < 0 || g_fpscap > 1000) g_fpscap = 60;
+    if (g_uiscale_cfg < 0.0f) g_uiscale_cfg = -1.0f;          /* auto */
+    else if (g_uiscale_cfg > 8.0f) g_uiscale_cfg = 8.0f;
+    hmc_uiscale_config(g_uiscale_cfg);
 }
 
 /* Parse "Resolution WxH" from HitmanContracts.ini in the game root (the parent of
@@ -237,6 +274,53 @@ static void read_game_resolution(void)
         break;
     }
     fclose(f);
+}
+
+/* UIScale re-believe drift guard, called at process detach: if the engine
+ * saved its (patched) layout resolution back into HitmanContracts.ini on
+ * exit, put the render resolution back — otherwise the next launch would
+ * divide the already-divided value again. Any other value (the user or an
+ * in-game switch changed it) is left alone. */
+static void restore_ini_resolution(void)
+{
+    if (!g_render_w || !g_render_h) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\..\\HitmanContracts.ini", g_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char out[8192], line[512];
+    size_t o = 0;
+    int changed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        int w = 0, h = 0;
+        if (_strnicmp(p, "Resolution", 10) == 0 &&
+            sscanf(p + 10, " %dx%d", &w, &h) == 2 &&
+            w == g_ini_w && h == g_ini_h) {
+            snprintf(line, sizeof(line), "Resolution %dx%d\n",
+                     g_render_w, g_render_h);
+            changed = 1;
+        }
+        size_t l = strlen(line);
+        if (o + l >= sizeof(out)) { changed = 0; break; }  /* too big: skip */
+        memcpy(out + o, line, l);
+        o += l;
+    }
+    fclose(f);
+    if (!changed) return;
+    f = fopen(path, "w");
+    if (!f) return;
+    fwrite(out, 1, o, f);
+    fclose(f);
+    logf_("HitmanContracts.ini: engine saved the layout resolution %dx%d — "
+          "restored the render resolution %dx%d", g_ini_w, g_ini_h,
+          g_render_w, g_render_h);
+}
+
+void hmc_widescreen_detach(void)
+{
+    restore_ini_resolution();
 }
 
 static int is_wine(void)
@@ -1376,11 +1460,18 @@ static void read_caps_once(void)
      * the borderless path worked under CrossOver but not on real Windows). */
     D3DDISPLAYMODE mode;
     if (SUCCEEDED(d->lpVtbl->GetAdapterDisplayMode(d, D3DADAPTER_DEFAULT,
-                                                   &mode)))
+                                                   &mode))) {
         g_desktop_fmt = mode.Format;
+        /* physical pixels — on a Retina Mac this is 2x the logical desktop
+         * GetSystemMetrics reports; UIScale's auto mode targets it */
+        g_mode_w = (int)mode.Width;
+        g_mode_h = (int)mode.Height;
+    }
     d->lpVtbl->Release(d);
-    logf_("device present-interval caps = 0x%08lx, desktop fmt = %d",
-          (unsigned long)g_present_intervals, g_desktop_fmt);
+    logf_("device present-interval caps = 0x%08lx, desktop fmt = %d, "
+          "adapter mode %dx%d",
+          (unsigned long)g_present_intervals, g_desktop_fmt,
+          g_mode_w, g_mode_h);
 }
 
 /* Is w x h @ refresh Hz an enumerated 32-bit display mode? */
@@ -1480,6 +1571,66 @@ static void choose_fs_interval(D3DPRESENT_PARAMETERS *pp)
 
 /* Presentation-parameters fixup: force windowed (the startup fix) and,
  * when borderless is wanted, expand to the desktop and strip the window. */
+/* UIScale=N (>1): make the engine lay the UI out N x bigger by patching its
+ * already-parsed copy of the HitmanContracts.ini resolution in memory to
+ * Resolution/N (hmc_uiscale_rebelieve, uiscale.c). Runs ONCE, at the first
+ * CreateDevice: this plugin loads before the engine parses its ini
+ * (d3d8.dll is a static import of the monolithic exe), so — unlike H2SA,
+ * which scans at plugin load — the parsed value only exists by the time the
+ * engine asks for a device; the device itself does not exist yet, so no
+ * device-derived copies can false-match. On success g_ini_w/h become the
+ * layout resolution and g_render_w/h the render (ini) resolution the device
+ * is pinned to.
+ *
+ * No fallback when the scan finds nothing, and UIScale=-1 (H2SA's
+ * grow-the-backbuffer auto mode) is rejected: growing the backbuffer behind
+ * this engine's back is what breaks it (it re-reads the real device size —
+ * see uiscale.c), so anything but a successful re-believe means OFF. */
+static void uiscale_try_rebelieve(void)
+{
+    static int attempted;
+    if (attempted) return;
+    attempted = 1;
+    float cfg = hmc_uiscale_cfg();
+    if (cfg == 0.0f || cfg == 1.0f) return;
+    if (cfg < 0.0f) {
+        logf_("UIScale=-1 (auto) is not supported on Contracts (the engine "
+              "re-reads the real device size) — off; use UIScale=N>1 with "
+              "the HitmanContracts.ini Resolution as the render resolution");
+        return;
+    }
+    if (!g_ini_w || !g_ini_h) {
+        logf_("UIScale=%.2f: no HitmanContracts.ini resolution — off",
+              (double)cfg);
+        return;
+    }
+    int lw = (int)(lround((double)g_ini_w / cfg / 2.0) * 2);
+    int lh = (int)(lround((double)g_ini_h / cfg / 2.0) * 2);
+    if (lw < 320 || lh < 200) {
+        logf_("UIScale=%.2f: layout %dx%d would be too small — off",
+              (double)cfg, lw, lh);
+        return;
+    }
+    if (hmc_uiscale_rebelieve(g_ini_w, g_ini_h, lw, lh) > 0) {
+        g_render_w = g_ini_w; g_render_h = g_ini_h;
+        g_ini_w = lw; g_ini_h = lh;
+        logf_("UIScale=%.2f: engine re-believed to layout %dx%d; "
+              "HitmanContracts.ini %dx%d stays the render resolution",
+              (double)cfg, lw, lh, g_render_w, g_render_h);
+        /* the loader's believed-canvas viewport/RHW/UV rescale keeps the
+         * post-filter coherent under re-believe; UIScalePostFilter=0 is
+         * the fallback that forces PostFilterLOD 0 in memory instead
+         * (re-asserted per frame in frame_limit; an ini edit would not
+         * stick, the engine re-saves the value from its detail setting on
+         * every exit) */
+        if (!g_uiscale_postfx)
+            hmc_uiscale_force_lod0();
+    } else {
+        logf_("UIScale=%.2f: engine resolution not re-believed (no parsed "
+              "copy found) — off", (double)cfg);
+    }
+}
+
 static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
                         int is_reset)
 {
@@ -1514,8 +1665,31 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
      *    snap output, garbage heights) still gets pinned. CreateDevice keeps
      *    the hard pin: at boot the engine's request is derived from its own
      *    mode selection, not from a live user choice. */
-    read_game_resolution();
-    if (g_ini_w && g_ini_h) {
+    if (!g_render_w) {
+        read_game_resolution();
+        if (!is_reset)
+            uiscale_try_rebelieve();   /* may split g_ini into layout +
+                                        * g_render_w/h (render) */
+    }
+    if (g_render_w && g_render_h) {
+        /* UIScale re-believed: g_ini_w/h is the layout resolution the
+         * engine was patched to believe; the device renders the
+         * HitmanContracts.ini (render) resolution. The resolution is locked
+         * for the session — an in-game switch cannot be honoured, since the
+         * engine's belief is already patched and cannot be re-pointed
+         * mid-run — and the ini is not re-read (it would clobber the
+         * layout/render split). */
+        if (is_reset &&
+            pp->BackBufferWidth && pp->BackBufferHeight &&
+            pp->BackBufferWidth != (UINT)g_render_w &&
+            is_curated_mode(pp->BackBufferWidth, pp->BackBufferHeight))
+            logf_("in-game resolution switch to %ux%u ignored: the "
+                  "resolution is locked while UIScale re-believe is active "
+                  "(restart the game to apply it)",
+                  pp->BackBufferWidth, pp->BackBufferHeight);
+        pp->BackBufferWidth = (UINT)g_render_w;
+        pp->BackBufferHeight = (UINT)g_render_h;
+    } else if (g_ini_w && g_ini_h) {
         if (is_reset &&
             pp->BackBufferWidth && pp->BackBufferHeight &&
             (pp->BackBufferWidth != (UINT)g_ini_w ||
@@ -1531,6 +1705,14 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
             pp->BackBufferHeight = (UINT)g_ini_h;
         }
     }
+    /* Arm/disarm the believed-space viewport rescale (uiscale.c) for the
+     * layout/render split; k = render/layout. Applies on the exclusive path
+     * below too — the backbuffer is the enumerated ini mode either way. */
+    if (g_render_w && g_render_h)
+        hmc_uiscale_setup(g_ini_w, g_ini_h,
+                          pp->BackBufferWidth, pp->BackBufferHeight);
+    else
+        hmc_uiscale_off();
 
     /* Exclusive fullscreen — REAL WINDOWS ONLY. It needs the requested
      * resolution to be an actual enumerated display mode (else CreateDevice
@@ -1826,6 +2008,12 @@ static void wait_until(LONGLONG deadline, LONGLONG freq)
  * there is a single, consistent clock — no two-clock beat. */
 static void frame_limit(void)
 {
+    /* UIScale + UIScalePostFilter=0: keep the parsed PostFilterLOD at 0
+     * (an in-game detail-setting change writes it back mid-session; see
+     * uiscale.c) */
+    if (g_render_w && g_render_h && !g_uiscale_postfx)
+        hmc_uiscale_force_lod0();
+
     if (g_fpscap <= 0) return;
 
     static LARGE_INTEGER freq, next;
@@ -1908,8 +2096,10 @@ static const HMCD3D8Hooks g_hooks = {
     HMC_D3D8_HOOKS_VERSION,
     fix_present,
     fix_projection,
-    NULL,
-    frame_limit,
+    NULL,           /* on_device */
+    frame_limit,    /* on_present */
+    NULL,           /* on_frame */
+    hmc_uiscale_fix_viewport,  /* believed-space viewports -> backbuffer */
 };
 
 void hmc_widescreen_init(HINSTANCE inst)
@@ -1940,12 +2130,12 @@ void hmc_widescreen_init(HINSTANCE inst)
         CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
     logf_("HMC Widescreen loaded%s, Fullscreen=%d Borderless=%d "
           "FOVCorrect=%d FOVFactor=%.2f PreserveAspect=%d FpsCap=%d "
-          "VSync=%d MouseClipFix=%d MouseMotionFix=%d, "
+          "VSync=%d MouseClipFix=%d MouseMotionFix=%d UIScale=%.2f, "
           "HitmanContracts.ini resolution %dx%d",
           g_enabled ? "" : " (disabled)",
           g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
           g_preserveaspect, g_fpscap, g_vsync, g_mouseclipfix,
-          g_mousemotionfix, g_ini_w, g_ini_h);
+          g_mousemotionfix, (double)g_uiscale_cfg, g_ini_w, g_ini_h);
 
     HMODULE loader = GetModuleHandleA("d3d8.dll");
     hmc_register_fn reg = loader ? (hmc_register_fn)(uintptr_t)

@@ -293,6 +293,60 @@ otherwise make the post-filter composite vanish or the textures go flat:
 - `PostFilterAlphaFix` (off by default) is an older, blunter workaround for
   the same class of problem, kept for testing.
 
+### UI scaling (`UIScale`)
+
+The engine lays its 2D layer out against the `HitmanContracts.ini`
+resolution, so without `UIScale` the UI-size knob is the `Resolution` line —
+a smaller resolution = a proportionally bigger UI, coupled with a softer 3D
+image (the backbuffer is pinned to it).
+
+`UIScale=N` (>1) decouples the two by **re-believing the engine** (the
+approach shared with the sibling
+[h2sa-asi-plugins](https://github.com/rtrydev/h2sa-asi-plugins) UIScale):
+the `HitmanContracts.ini Resolution` stays the **render** resolution, and the
+plugin patches the engine's already-parsed copy of it in memory to
+`Resolution/N`, so the whole 2D layer is laid out N× bigger — e.g.
+`Resolution 1920x1200` + `UIScale=1.5` renders 1920x1200 with the UI sized as
+at 1280x800. The device keeps rendering the ini resolution exactly as with
+the feature off; the believed-space leftovers (viewports the engine sets in
+layout pixels) are rescaled through the loader's v4 `fix_viewport` hook.
+
+Two Contracts-specific differences from H2SA:
+
+- The scan-and-patch runs at the **first `CreateDevice`**, not at plugin
+  load: Contracts imports `d3d8.dll` statically, so the plugins load before
+  the engine has parsed its ini (H2SA's plugins load from inside the
+  engine's `LoadLibrary(RenderD3D.dll)`, after the parse). The device does
+  not exist yet at that point, so no device-derived copies can false-match.
+- H2SA's other mode — `UIScale=-1`, keep the ini as the layout size and
+  *grow* the backbuffer — is **not supported and treated as off**: verified
+  in-game, Contracts reads the real device size back after `CreateDevice`
+  and derives its runtime viewports and post-filter buffers from it while
+  parts of the 2D layer stay ini-derived, so that decoupling renders the UI
+  at two inconsistent scales. For the same reason a failed re-believe scan
+  means the feature stays off (no supersampling fallback).
+
+While re-believed, the in-game resolution switch is locked for the session
+(the engine's patched belief cannot be re-pointed mid-run; a switch is
+logged and applies on the next launch). If the engine saves the divided
+layout value back into `HitmanContracts.ini` on exit, a detach-time guard
+restores the render resolution so repeated launches cannot divide it twice.
+
+The **post-filter (bloom/colour-grade) runs under UIScale**: the loader
+treats every render target of the full backbuffer size as a believed-space
+canvas (the engine renders its scene, menus and post passes through such
+RTs and blits them 1:1), rescaling the believed-space viewports and RHW
+quads inside them, and rescaling the **texture coordinates** of draws that
+sample those full-size RTs (the engine computes them as layout-derived
+sub-rects; the content now fills the RT, so the UVs follow — full-range
+0..1 blits are unaffected by the scale-and-clamp). Device-space geometry
+(e.g. the video player's quads) is detected by its coordinates and left
+alone. If the post path ever misbehaves, `UIScalePostFilter=0` is the
+fallback: it forces the engine's parsed `PostFilterLOD` to 0 in memory
+(re-asserted every frame — an ini edit would not stick, the engine re-saves
+that value from its detail setting on every exit), rendering the scene
+directly into the backbuffer with no post effects.
+
 ### Rain performance caps
 
 The heaviest rain scenes are CPU-bound in the game's rain particle vertex
@@ -331,6 +385,11 @@ RainSystemCap=0     ; rain CPU limiter, systems per frame; 0 = off
 ForceWinMouse=-1    ; mouse buttons fix: -1 auto (on under Wine), 0 off, 1 on
 MouseClipFix=-1     ; mouse-look edge-wall fix: -1 auto, 0 off, 1 on
 MouseMotionFix=-1   ; slow-move stall fix: -1 auto, 0 off, 1 on
+UIScale=0           ; N>1 = UI laid out N x bigger while the ini Resolution
+                    ; stays the render resolution (re-believe, see above);
+                    ; 0/1 = off; -1 not supported on Contracts
+UIScalePostFilter=1 ; keep the post-filter under UIScale (default); 0 =
+                    ; force PostFilterLOD 0 in memory instead (fallback)
 ```
 
 Install output: loader `d3d8.dll` (game root); `scripts/hmc_display.asi` +

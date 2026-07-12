@@ -21,10 +21,10 @@ diag: ../dist/hmc_reduced_x87_diag.asi
 	$(CC) $(CFLAGS) -o $@ asiloader.c d3d8.def $(LDFLAGS) \
 	      -Wl,--enable-stdcall-fixup -luser32 -lgdi32
 
-../dist/hmc_display.asi: display_main.c widescreen.c profiler.c \
+../dist/hmc_display.asi: display_main.c widescreen.c profiler.c uiscale.c \
                          hmc_d3d8.h hmc_plugin.h
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ display_main.c widescreen.c profiler.c \
+	$(CC) $(CFLAGS) -o $@ display_main.c widescreen.c profiler.c uiscale.c \
 	      $(LDFLAGS) -luser32 -lgdi32 -lwinmm
 
 ../dist/hmc_reduced_x87.asi: hmcx87.c helpers.S

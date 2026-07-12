@@ -10,3 +10,5 @@ EXPORTS
     ValidateVertexShader @5
     HMC_RegisterD3D8Hooks
     HMC_IsCuratedMode
+    HMC_SetUIScale
+    HMC_GetUIScale

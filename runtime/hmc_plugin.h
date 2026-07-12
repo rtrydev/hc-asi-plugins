@@ -15,7 +15,23 @@ void hmc_vlogf(const char *tag, const char *fmt, va_list ap);
 
 /* feature entry points, called from display_main.c's DllMain */
 void hmc_widescreen_init(HINSTANCE inst);
+void hmc_widescreen_detach(void);
 void hmc_profiler_init(HINSTANCE inst);
 void hmc_profiler_detach(void);
+
+/* uiscale.c — believed-resolution UI scaling. widescreen.c forwards the
+ * [display] UIScale config, decides the backbuffer size in fix_present and
+ * calls setup/off; the fix_viewport hook goes into widescreen.c's v4 hook
+ * registration (declared there — it is D3D-typed). The profiler multiplies
+ * its glyph size by hmc_uiscale_k(). */
+void  hmc_uiscale_config(float uiscale);
+float hmc_uiscale_cfg(void);
+int   hmc_uiscale_wanted(void);
+int   hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh);
+int   hmc_uiscale_force_lod0(void);
+void  hmc_uiscale_setup(int ini_w, int ini_h,
+                        unsigned bb_w, unsigned bb_h);
+void  hmc_uiscale_off(void);
+float hmc_uiscale_k(void);
 
 #endif /* HMC_PLUGIN_H */

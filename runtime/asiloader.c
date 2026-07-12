@@ -31,6 +31,7 @@
 #include <d3d8.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include "hmc_d3d8.h"
@@ -55,6 +56,7 @@
 #define IDX_DEV_DRAWINDEXPRIM   71
 #define IDX_DEV_DRAWPRIMUP      72
 #define IDX_DEV_DRAWINDEXPRIMUP 73
+#define IDX_DEV_SETVSHADER      76
 /* IDirect3DVertexBuffer8: IUnknown(0..2) + IDirect3DResource8(3..10) + Lock(11) */
 #define IDX_VB_LOCK             11
 
@@ -81,6 +83,31 @@ static unsigned int g_bbw, g_bbh;   /* backbuffer size of the live device */
 static int g_vp_logs, g_proj_logs;  /* diagnostic sample counters */
 static int g_rt_logs;               /* render-target creation log counter */
 
+/* UI scale (published by the widescreen plugin via HMC_SetUIScale): the
+ * backbuffer/believed-(layout-)resolution ratios of the UIScale re-believe
+ * feature. 1.0/1.0 = off. ky is re-exported to overlay plugins via
+ * HMC_GetUIScale.
+ *
+ * While active, the loader itself scales the engine's believed-space
+ * pre-transformed (XYZRHW) draws to the backbuffer by kx/ky: the re-believed
+ * engine emits its whole 2D layer — HUD/menu quads and the post-filter
+ * composite — as RHW vertices in LAYOUT pixels, which no viewport can
+ * rescale (D3D applies no transform to RHW vertices), so without this the
+ * frame occupies only the layout-sized corner of the backbuffer. Draws into
+ * offscreen RTs are left in layout space (the engine samples those RTs at
+ * layout-derived sub-rect UVs — scaling either side alone would break the
+ * pairing), and overlay plugins drawing during on_frame are exempt (they
+ * draw in real backbuffer pixels). */
+static volatile float g_uiscale_kx = 1.0f, g_uiscale_ky = 1.0f;
+static DWORD g_cur_fvf;         /* SetVertexShader FVF (0 = none/shader) */
+static int g_in_overlay;        /* inside plugin on_frame draws */
+static void *g_orig_setvshader;
+static void *g_up_scratch;      /* scaled-vertex scratch buffer */
+static size_t g_up_scratch_sz;
+static void *g_idx_scratch;     /* index scratch for redirected VB draws */
+static size_t g_idx_scratch_sz;
+static int g_rhw_logs;
+
 /* Post-filter alpha repair. On the CrossOver D3D->Metal stack the A8
  * render-target alpha that fixes Contracts's ground/detail blending also
  * leaves the game's post-filter composite at alpha ~= 0, so its final
@@ -103,6 +130,7 @@ static int g_postfx_opaque_rt;
 static unsigned g_postfx_opaque_mask = 0x03;
 static IDirect3DSurface8 *g_backbuffer;
 static int g_rt_is_backbuffer = 1;
+static unsigned int g_rt_w, g_rt_h;   /* bound render-target size */
 static int g_stage0_is_rttex;
 static UINT g_stage0_rt_w, g_stage0_rt_h;
 static D3DFORMAT g_stage0_rt_fmt;
@@ -133,6 +161,7 @@ static int postfilter_rt_site(uint32_t rva)
             return (g_postfx_opaque_mask & (1u << i)) ? i : -1;
     return -1;
 }
+
 
 #define MAX_RT_TEX 64
 typedef struct { IDirect3DBaseTexture8 *tex; UINT w, h; D3DFORMAT fmt; } RTTex;
@@ -278,6 +307,7 @@ static void capture_backbuffer(IDirect3DDevice8 *dev)
         release_iunknown(bb);
     g_backbuffer = bb;
     g_rt_is_backbuffer = 1;
+    g_rt_w = g_bbw; g_rt_h = g_bbh;
 }
 
 /* Drop every cached object pointer of the current device generation. A Reset
@@ -403,6 +433,16 @@ static HRESULT WINAPI hook_CreateTexture(IDirect3DDevice8 *self, UINT W, UINT H,
     uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
     void *ret = __builtin_return_address(0);
     uint32_t rva = base ? (uint32_t)((uint8_t *)ret - base) : 0;
+    /* NOTE (UIScale post-mortem): an earlier revision rescaled the six
+     * post-filter RT creations here by the UI-scale ratio, assuming the
+     * engine sized them from the believed HitmanContracts.ini resolution
+     * the way H2SA does. It does not: Contracts reads the REAL device
+     * backbuffer size back after CreateDevice and sizes these buffers (and
+     * its runtime viewports) from it, so the rescale double-scaled them
+     * past the D3D texture limits (observed 3600x2250 -> 10125x6328). The
+     * engine re-reading the device size is also what sinks the whole
+     * believed-resolution UIScale approach on this engine build — see
+     * uiscale.c. */
     D3DFORMAT requested_fmt = Fmt;
     if (g_postfx_opaque_rt && (Usage & D3DUSAGE_RENDERTARGET) &&
         Fmt == D3DFMT_A8R8G8B8) {
@@ -466,7 +506,30 @@ static HRESULT WINAPI hook_SetRenderTarget(IDirect3DDevice8 *self,
     typedef HRESULT (WINAPI *srt_t)(IDirect3DDevice8 *, IDirect3DSurface8 *,
         IDirect3DSurface8 *);
     g_rt_is_backbuffer = (!rt || (g_backbuffer && rt == g_backbuffer));
+    if (g_rt_is_backbuffer) {
+        g_rt_w = g_bbw; g_rt_h = g_bbh;
+    } else {
+        /* remember the offscreen target's size: a full-backbuffer-sized RT
+         * is a believed-space canvas for the UIScale rescale (the engine
+         * renders scene+menu into such RTs and blits them 1:1) */
+        typedef HRESULT (WINAPI *gd_t)(IDirect3DSurface8 *,
+            D3DSURFACE_DESC *);
+        D3DSURFACE_DESC sd;
+        if (SUCCEEDED(((gd_t)(*(void ***)rt)[8])(rt, &sd))) {
+            g_rt_w = sd.Width; g_rt_h = sd.Height;
+        } else {
+            g_rt_w = g_rt_h = 0;
+        }
+    }
     return ((srt_t)g_orig_setrendertarget)(self, rt, zs);
+}
+
+/* The UIScale believed-space rescale applies wherever the engine lays a
+ * believed-space frame out: the backbuffer, or an offscreen RT of the full
+ * backbuffer size (the engine's scene/menu canvases, blitted 1:1). */
+static int rt_is_believed_canvas(void)
+{
+    return g_rt_is_backbuffer || (g_rt_w == g_bbw && g_rt_h == g_bbh);
 }
 
 static HRESULT WINAPI hook_SetRenderState(IDirect3DDevice8 *self,
@@ -685,23 +748,368 @@ static HRESULT timed_draw(IDirect3DDevice8 *self, void *ret,
     return hr;
 }
 
+/* ---- UIScale believed-space RHW rescale ------------------------------ */
+
+static HRESULT WINAPI hook_SetVertexShader(IDirect3DDevice8 *self,
+    DWORD handle)
+{
+    typedef HRESULT (WINAPI *sv_t)(IDirect3DDevice8 *, DWORD);
+    /* FVF codes never have D3DFVF_RESERVED0 (bit 0) set; created-shader
+     * handles do. Contracts is a fixed-function title, so this is the FVF. */
+    g_cur_fvf = (handle & 1) ? 0 : handle;
+    return ((sv_t)g_orig_setvshader)(self, handle);
+}
+
+/* Byte offset of texture-coordinate set 0 in an XYZRHW FVF vertex, or 0
+ * when there is none (or it is not 2D). */
+static UINT fvf_uv0_offset(DWORD fvf)
+{
+    if ((fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW) return 0;
+    if (((fvf >> D3DFVF_TEXCOUNT_SHIFT) & 0xF) == 0) return 0;
+    if (((fvf >> 16) & 3) != 0) return 0;   /* set 0 not 2D */
+    UINT off = 16;
+    if (fvf & D3DFVF_DIFFUSE)  off += 4;
+    if (fvf & D3DFVF_SPECULAR) off += 4;
+    return off;
+}
+
+/* What (if anything) must be rescaled on this RHW draw?
+ *  - POSITIONS (layout pixels -> target pixels) when the render target is
+ *    a believed-space canvas (backbuffer or full-backbuffer-sized RT);
+ *  - TEX SET 0 (layout-derived sub-rect -> full range) when the draw
+ *    SAMPLES a full-backbuffer-sized RT texture: the engine computes those
+ *    UVs from its believed viewport over the real RT size, and the
+ *    believed-canvas viewport scaling makes the content fill the RT, so
+ *    the UVs must follow (x k, clamped). Full-range 0..1 UVs — device-
+ *    coherent blits — are unchanged by scale+clamp on the quad's corner
+ *    vertices, so they stay correct. This is what lets the post-filter
+ *    (bloom bright-pass, blur reads, composite) run under UIScale.
+ * Returns nonzero when a redirect is needed; fills do_pos / uv_off. */
+static int uiscale_rhw_wanted(int *do_pos, UINT *uv_off)
+{
+    *do_pos = 0;
+    *uv_off = 0;
+    if (!(g_uiscale_kx > 1.02f || g_uiscale_ky > 1.02f) || g_in_overlay)
+        return 0;
+    if ((g_cur_fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW)
+        return 0;
+    *do_pos = rt_is_believed_canvas();
+    if (g_stage0_is_rttex && g_bbw &&
+        g_stage0_rt_w == g_bbw && g_stage0_rt_h == g_bbh)
+        *uv_off = fvf_uv0_offset(g_cur_fvf);
+    return *do_pos || *uv_off;
+}
+
+static UINT prim_vertex_count(D3DPRIMITIVETYPE t, UINT n)
+{
+    switch (t) {
+    case D3DPT_POINTLIST:     return n;
+    case D3DPT_LINELIST:      return n * 2;
+    case D3DPT_LINESTRIP:     return n + 1;
+    case D3DPT_TRIANGLELIST:  return n * 3;
+    case D3DPT_TRIANGLESTRIP:
+    case D3DPT_TRIANGLEFAN:   return n + 2;
+    default:                  return 0;
+    }
+}
+
+static void *scratch_ensure(void **buf, size_t *sz, size_t need)
+{
+    if (need <= *sz) return *buf;
+    size_t grow = need < 4096 ? 4096 : need * 2;
+    void *n = realloc(*buf, grow);
+    if (!n) return NULL;
+    *buf = n;
+    *sz = grow;
+    return n;
+}
+
+static void scale_rhw_verts(void *verts, UINT stride, UINT first, UINT count,
+                            int do_pos, UINT uv_off)
+{
+    uint8_t *v = (uint8_t *)verts + (size_t)first * stride;
+    for (UINT i = 0; i < count; i++, v += stride) {
+        if (do_pos) {
+            float xy[2];
+            memcpy(xy, v, 8);
+            /* pixel-center mapping: RHW coordinates address pixel CENTERS
+             * (a full-screen quad ends at w-0.5). Plain x*k maps w-0.5
+             * short of the last target pixel, leaving an uncovered line at
+             * the right/bottom edge; (x+0.5)*k-0.5 lands edges on edges. */
+            xy[0] = (xy[0] + 0.5f) * g_uiscale_kx - 0.5f;
+            xy[1] = (xy[1] + 0.5f) * g_uiscale_ky - 0.5f;
+            memcpy(v, xy, 8);
+        }
+        if (uv_off) {
+            float uv[2];
+            memcpy(uv, v + uv_off, 8);
+            uv[0] *= g_uiscale_kx;
+            uv[1] *= g_uiscale_ky;
+            if (uv[0] > 1.0f) uv[0] = 1.0f;
+            if (uv[1] > 1.0f) uv[1] = 1.0f;
+            if (uv[0] < 0.0f) uv[0] = 0.0f;
+            if (uv[1] < 0.0f) uv[1] = 0.0f;
+            memcpy(v + uv_off, uv, 8);
+        }
+    }
+}
+
+/* Is this vertex range believed-(layout-)space? The engine's 2D layer emits
+ * coordinates within the layout resolution (backbuffer / k); a few RHW
+ * emitters size their quads from the REAL display instead — the intro-video
+ * player reads the display mode, which is deliberately not patched — and
+ * scaling those again pushes them off-screen. Coordinates already past the
+ * layout bounds mean device space: leave the draw alone. */
+static int rhw_verts_in_layout(const void *verts, UINT stride, UINT first,
+                               UINT count)
+{
+    float lw = (float)g_bbw / g_uiscale_kx + 2.0f;
+    float lh = (float)g_bbh / g_uiscale_ky + 2.0f;
+    const uint8_t *v = (const uint8_t *)verts + (size_t)first * stride;
+    for (UINT i = 0; i < count; i++, v += stride) {
+        float xy[2];
+        memcpy(xy, v, 8);
+        if (xy[0] > lw || xy[1] > lh) {
+            static int logged;
+            if (!logged) {
+                logged = 1;
+                logf_("UIScale: device-space RHW draw left unscaled "
+                      "(x=%.1f y=%.1f > layout %.0fx%.0f — e.g. the video "
+                      "player)", xy[0], xy[1], (double)lw, (double)lh);
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void rhw_scale_log(UINT stride, UINT count, int do_pos, UINT uv_off,
+                          const char *how, void *ret)
+{
+    if (g_rhw_logs >= 8) return;
+    g_rhw_logs++;
+    uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+    logf_("UIScale: RHW %s draw scaled x%.2f/%.2f (%s%s, fvf=0x%lx stride=%u "
+          "verts=%u) at exe+0x%tx", how, (double)g_uiscale_kx,
+          (double)g_uiscale_ky, do_pos ? "pos" : "",
+          uv_off ? (do_pos ? "+uv" : "uv") : "",
+          (unsigned long)g_cur_fvf, stride, count,
+          base ? (uint8_t *)ret - base : 0);
+}
+
+/* Copy `total` vertices to the scratch buffer and rescale positions and/or
+ * texture set 0 of vertices [first, first+count). Returns the scratch, or
+ * NULL (draw unmodified) on any doubt. */
+static const void *uiscale_scale_rhw(const void *data, UINT stride,
+                                     UINT first, UINT count, UINT total,
+                                     int do_pos, UINT uv_off, void *ret)
+{
+    if (!data || stride < 16 || !count || !total || first + count > total)
+        return NULL;
+    size_t need = (size_t)total * stride;
+    if (!scratch_ensure(&g_up_scratch, &g_up_scratch_sz, need))
+        return NULL;
+    if (do_pos && !rhw_verts_in_layout(data, stride, first, count))
+        do_pos = 0;   /* device-space positions: leave them */
+    if (!do_pos && !uv_off)
+        return NULL;
+    memcpy(g_up_scratch, data, need);
+    scale_rhw_verts(g_up_scratch, stride, first, count, do_pos, uv_off);
+    rhw_scale_log(stride, count, do_pos, uv_off, "UP", ret);
+    return g_up_scratch;
+}
+
+/* Diagnostic: a believed-space RHW vertex-buffer draw the redirect below
+ * could not handle (lock failure etc.) — log once so it is visible. */
+static void uiscale_rhw_vb_diag(void *ret)
+{
+    static int logged;
+    int do_pos; UINT uv_off;
+    if (logged || !uiscale_rhw_wanted(&do_pos, &uv_off)) return;
+    logged = 1;
+    uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
+    logf_("UIScale: WARNING — RHW draw from a vertex buffer at exe+0x%tx "
+          "is NOT rescaled (redirect failed)",
+          base ? (uint8_t *)ret - base : 0);
+}
+
+/* The engine's 2D layer submits its believed-space RHW quads from vertex
+ * buffers (DrawPrimitive/DrawIndexedPrimitive), which cannot be edited in
+ * flight. Redirect: read the drawn vertex (and index) range out of the
+ * bound buffers, scale x/y on a scratch copy, submit through the UP
+ * entrypoints (via timed_draw, so the postfx alpha fix still wraps the
+ * composite), then restore the stream-0/index bindings the UP draw
+ * clobbers. Returns 1 with *out set when handled; 0 = draw normally. */
+typedef HRESULT (WINAPI *gss_t)(IDirect3DDevice8 *, UINT,
+    IDirect3DVertexBuffer8 **, UINT *);
+typedef HRESULT (WINAPI *sss_t)(IDirect3DDevice8 *, UINT,
+    IDirect3DVertexBuffer8 *, UINT);
+typedef HRESULT (WINAPI *gidx_t)(IDirect3DDevice8 *, IDirect3DIndexBuffer8 **,
+    UINT *);
+typedef HRESULT (WINAPI *sidx_t)(IDirect3DDevice8 *, IDirect3DIndexBuffer8 *,
+    UINT);
+typedef HRESULT (WINAPI *buflock_t)(void *, UINT, UINT, BYTE **, DWORD);
+typedef HRESULT (WINAPI *bufunlock_t)(void *);
+#define BUF_LOCK(b)   ((buflock_t)(*(void ***)(b))[11])
+#define BUF_UNLOCK(b) ((bufunlock_t)(*(void ***)(b))[12])
+#define DEVFN(d, i, ty) ((ty)(*(void ***)(d))[i])
+
+/* Lock a byte range of a VB/IB for reading. READONLY first; a WRITEONLY
+ * buffer can reject that on native D3D8, so retry with no flags (wined3d
+ * keeps these sysmem-backed either way). */
+static BYTE *buf_lock_read(void *buf, UINT off, UINT size)
+{
+    BYTE *p = NULL;
+    if (SUCCEEDED(BUF_LOCK(buf)(buf, off, size, &p, D3DLOCK_READONLY)) && p)
+        return p;
+    p = NULL;
+    if (SUCCEEDED(BUF_LOCK(buf)(buf, off, size, &p, 0)) && p)
+        return p;
+    return NULL;
+}
+
+static int uiscale_vb_draw_scaled(IDirect3DDevice8 *self, D3DPRIMITIVETYPE t,
+    UINT start, UINT primcount, int do_pos, UINT uv_off, void *ret,
+    HRESULT *out)
+{
+    UINT vcount = prim_vertex_count(t, primcount);
+    IDirect3DVertexBuffer8 *vb = NULL;
+    UINT stride = 0;
+    if (!vcount) return 0;
+    if (FAILED(DEVFN(self, 84, gss_t)(self, 0, &vb, &stride)) || !vb)
+        return 0;
+    int ok = 0, locked = 0;
+    BYTE *src = NULL;
+    if (stride >= 16 && (!uv_off || uv_off + 8 <= stride) &&
+        scratch_ensure(&g_up_scratch, &g_up_scratch_sz,
+                       (size_t)vcount * stride) &&
+        (src = buf_lock_read(vb, start * stride, vcount * stride)) != NULL) {
+        memcpy(g_up_scratch, src, (size_t)vcount * stride);
+        BUF_UNLOCK(vb)(vb);
+        locked = 1;
+        if (do_pos && !rhw_verts_in_layout(g_up_scratch, stride, 0, vcount))
+            do_pos = 0;   /* device-space positions: leave them */
+        if (do_pos || uv_off) {
+            scale_rhw_verts(g_up_scratch, stride, 0, vcount, do_pos, uv_off);
+            rhw_scale_log(stride, vcount, do_pos, uv_off, "VB", ret);
+            DrawCtx c = {0};
+            c.self = self; c.t = t; c.a = primcount;
+            c.p = g_up_scratch; c.stride = stride;
+            *out = timed_draw(self, ret, call_DrawPrimitiveUP, &c, 0);
+            /* the UP draw cleared the stream-0 binding; put the engine's
+             * back */
+            DEVFN(self, 83, sss_t)(self, 0, vb, stride);
+            ok = 1;
+        }
+    }
+    release_iunknown(vb);   /* GetStreamSource AddRef'd it */
+    if (!ok && !locked)
+        uiscale_rhw_vb_diag((void *)ret);   /* lock/alloc failed */
+    return ok;
+}
+
+static int uiscale_vb_idraw_scaled(IDirect3DDevice8 *self,
+    D3DPRIMITIVETYPE t, UINT minV, UINT numV, UINT startIdx, UINT primcount,
+    int do_pos, UINT uv_off, void *ret, HRESULT *out)
+{
+    UINT idxcount = prim_vertex_count(t, primcount);
+    if (!idxcount || !numV) return 0;
+    IDirect3DVertexBuffer8 *vb = NULL;
+    IDirect3DIndexBuffer8 *ib = NULL;
+    UINT stride = 0, base = 0;
+    if (FAILED(DEVFN(self, 84, gss_t)(self, 0, &vb, &stride)) || !vb)
+        return 0;
+    if (FAILED(DEVFN(self, 86, gidx_t)(self, &ib, &base)) || !ib) {
+        release_iunknown(vb);
+        return 0;
+    }
+    D3DINDEXBUFFER_DESC id;
+    typedef HRESULT (WINAPI *ibdesc_t)(void *, D3DINDEXBUFFER_DESC *);
+    int ok = 0, locked = 0;
+    if (SUCCEEDED(((ibdesc_t)(*(void ***)ib)[13])(ib, &id)) &&
+        (id.Format == D3DFMT_INDEX16 || id.Format == D3DFMT_INDEX32) &&
+        stride >= 16 && (!uv_off || uv_off + 8 <= stride)) {
+        UINT isz = id.Format == D3DFMT_INDEX16 ? 2 : 4;
+        /* scratch vertex array addressed by the UNCHANGED index values:
+         * scratch[i] (i in [minV, minV+numV)) = vb[(base+i)]; the head
+         * below minV is never fetched */
+        size_t vneed = (size_t)(minV + numV) * stride;
+        BYTE *vsrc = NULL, *isrc = NULL;
+        if (scratch_ensure(&g_up_scratch, &g_up_scratch_sz, vneed) &&
+            scratch_ensure(&g_idx_scratch, &g_idx_scratch_sz,
+                           (size_t)idxcount * isz) &&
+            (vsrc = buf_lock_read(vb, (base + minV) * stride,
+                                  numV * stride)) != NULL) {
+            if ((isrc = buf_lock_read(ib, startIdx * isz,
+                                      idxcount * isz)) != NULL) {
+                memcpy((uint8_t *)g_up_scratch + (size_t)minV * stride,
+                       vsrc, (size_t)numV * stride);
+                memcpy(g_idx_scratch, isrc, (size_t)idxcount * isz);
+                BUF_UNLOCK(ib)(ib);
+                BUF_UNLOCK(vb)(vb);
+                locked = 1;
+                if (do_pos &&
+                    !rhw_verts_in_layout(g_up_scratch, stride, minV, numV))
+                    do_pos = 0;   /* device-space positions: leave them */
+                if (do_pos || uv_off) {
+                    scale_rhw_verts(g_up_scratch, stride, minV, numV,
+                                    do_pos, uv_off);
+                    rhw_scale_log(stride, numV, do_pos, uv_off,
+                                  "VB-indexed", ret);
+                    DrawCtx c = {0};
+                    c.self = self; c.t = t; c.a = minV; c.b = numV;
+                    c.c = primcount; c.p = g_idx_scratch; c.q = g_up_scratch;
+                    c.fmt = id.Format; c.stride = stride;
+                    *out = timed_draw(self, ret, call_DrawIndexedPrimitiveUP,
+                                      &c, 0);
+                    /* restore the bindings the UP draw clobbered */
+                    DEVFN(self, 83, sss_t)(self, 0, vb, stride);
+                    DEVFN(self, 85, sidx_t)(self, ib, base);
+                    ok = 1;
+                }
+            } else {
+                BUF_UNLOCK(vb)(vb);
+            }
+        }
+    }
+    release_iunknown(ib);
+    release_iunknown(vb);
+    if (!ok && !locked)
+        uiscale_rhw_vb_diag((void *)ret);   /* lock/alloc failed */
+    return ok;
+}
+
 static HRESULT WINAPI hook_DrawPrimitive(IDirect3DDevice8 *self,
     D3DPRIMITIVETYPE t, UINT start, UINT count)
 {
+    void *ret = __builtin_return_address(0);
+    int do_pos; UINT uv_off;
+    if (uiscale_rhw_wanted(&do_pos, &uv_off)) {
+        HRESULT hr;
+        if (uiscale_vb_draw_scaled(self, t, start, count, do_pos, uv_off,
+                                   ret, &hr))
+            return hr;
+    }
     DrawCtx c = {0};
     c.self = self; c.t = t; c.a = start; c.b = count;
-    return timed_draw(self, __builtin_return_address(0), call_DrawPrimitive,
-                      &c, 0);
+    return timed_draw(self, ret, call_DrawPrimitive, &c, 0);
 }
 
 static HRESULT WINAPI hook_DrawIndexedPrimitive(IDirect3DDevice8 *self,
     D3DPRIMITIVETYPE t, UINT minIdx, UINT numV, UINT startIdx, UINT count)
 {
+    void *ret = __builtin_return_address(0);
+    int do_pos; UINT uv_off;
+    if (uiscale_rhw_wanted(&do_pos, &uv_off)) {
+        HRESULT hr;
+        if (uiscale_vb_idraw_scaled(self, t, minIdx, numV, startIdx, count,
+                                    do_pos, uv_off, ret, &hr))
+            return hr;
+    }
     DrawCtx c = {0};
     c.self = self; c.t = t; c.a = minIdx; c.b = numV;
     c.c = startIdx; c.d = count;
-    return timed_draw(self, __builtin_return_address(0),
-                      call_DrawIndexedPrimitive, &c, 0);
+    return timed_draw(self, ret, call_DrawIndexedPrimitive, &c, 0);
 }
 
 static HRESULT WINAPI hook_DrawPrimitiveUP(IDirect3DDevice8 *self,
@@ -709,6 +1117,15 @@ static HRESULT WINAPI hook_DrawPrimitiveUP(IDirect3DDevice8 *self,
 {
     DrawCtx c = {0};
     c.self = self; c.t = t; c.a = count; c.p = data; c.stride = stride;
+    int do_pos; UINT uv_off;
+    if (uiscale_rhw_wanted(&do_pos, &uv_off)) {
+        if (uv_off && uv_off + 8 > stride) uv_off = 0;
+        UINT n = prim_vertex_count(t, count);
+        const void *s = uiscale_scale_rhw(data, stride, 0, n, n, do_pos,
+                                          uv_off,
+                                          __builtin_return_address(0));
+        if (s) c.p = s;
+    }
     return timed_draw(self, __builtin_return_address(0), call_DrawPrimitiveUP,
                       &c, 1);
 }
@@ -720,6 +1137,16 @@ static HRESULT WINAPI hook_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self,
     DrawCtx c = {0};
     c.self = self; c.t = t; c.a = minV; c.b = numV; c.c = count;
     c.p = idx; c.q = data; c.fmt = idxFmt; c.stride = stride;
+    int do_pos; UINT uv_off;
+    if (uiscale_rhw_wanted(&do_pos, &uv_off)) {
+        if (uv_off && uv_off + 8 > stride) uv_off = 0;
+        /* indices address vertices from the data base; the used range is
+         * [minV, minV+numV) */
+        const void *s = uiscale_scale_rhw(data, stride, minV, numV,
+                                          minV + numV, do_pos, uv_off,
+                                          __builtin_return_address(0));
+        if (s) c.q = s;
+    }
     return timed_draw(self, __builtin_return_address(0),
                       call_DrawIndexedPrimitiveUP, &c, 1);
 }
@@ -953,6 +1380,25 @@ static HRESULT WINAPI hook_SetViewport(IDirect3DDevice8 *self,
      * is clamped to the full backbuffer — that restores correct rendering
      * without touching game code. Legitimate sub-viewports (HUD elements etc.)
      * fit and pass through untouched. */
+    D3DVIEWPORT8 scaled;
+    if (vp && rt_is_believed_canvas()) {
+        /* Plugins first (UI scale: engine viewports arrive in the believed
+         * layout resolution and are rescaled to the real backbuffer); the
+         * garbage clamp below then sees the rescaled values. ONLY while the
+         * render target is a believed-space canvas (the backbuffer or a
+         * full-backbuffer-sized RT): the engine also sets small
+         * device-derived viewports into its smaller RTs (e.g. the
+         * quarter-res bloom buffer), which happen to fit the layout
+         * resolution — scaling those would push them past their RT
+         * (observed: 640x400 bloom viewport blown to 1919x1199). */
+        int any = 0;
+        for (int i = 0; i < g_n_hooks; i++)
+            if (g_hooks[i].fix_viewport) {
+                if (!any) { scaled = *vp; any = 1; }
+                g_hooks[i].fix_viewport(&scaled, g_bbw, g_bbh);
+            }
+        if (any) vp = &scaled;
+    }
     D3DVIEWPORT8 fixed;
     if (vp && g_bbw && g_bbh &&
         (vp->X + vp->Width > g_bbw || vp->Y + vp->Height > g_bbh ||
@@ -1015,10 +1461,14 @@ static HRESULT WINAPI hook_Present(IDirect3DDevice8 *self,
     typedef HRESULT (WINAPI *pr_t)(IDirect3DDevice8 *, CONST RECT *,
         CONST RECT *, HWND, CONST RGNDATA *);
     /* Before the frame is shown: let overlays draw onto the finished back
-     * buffer (drawing in on_present, below, would land after Present). */
+     * buffer (drawing in on_present, below, would land after Present).
+     * Overlays draw in real backbuffer pixels — exempt from the UIScale
+     * RHW rescale. */
+    g_in_overlay = 1;
     for (int i = 0; i < g_n_hooks; i++)
         if (g_hooks[i].on_frame)
             g_hooks[i].on_frame(self);
+    g_in_overlay = 0;
     LARGE_INTEGER t0;
     if (g_drawstats) QueryPerformanceCounter(&t0);
     HRESULT hr = ((pr_t)g_orig_present)(self, src, dst, override, dirty);
@@ -1061,7 +1511,7 @@ static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
         hr = ((rs_t)g_orig_reset)(self, pp);
         logf_("windowed-default Reset retry -> 0x%08lx", (unsigned long)hr);
     }
-    if (SUCCEEDED(hr) && g_postfx_alpha_fix)
+    if (SUCCEEDED(hr))
         capture_backbuffer(self);
     return hr;
 }
@@ -1150,14 +1600,18 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
                    (void *)hook_CreateRenderTarget, &g_orig_createrendertgt);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CREATEIMAGESURF,
                    (void *)hook_CreateImageSurface, &g_orig_createimagesurf);
+        /* Always track the current render target (backbuffer vs offscreen
+         * RT) and the stage-0 texture (RT-texture sampling): the plugin
+         * fix_viewport pass and the UIScale RHW/UV rescale are gated on
+         * them. */
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETRENDERTARGET,
+                   (void *)hook_SetRenderTarget, &g_orig_setrendertarget);
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETTEXTURE,
+                   (void *)hook_SetTexture, &g_orig_settexture);
+        capture_backbuffer(*ppReturnedDeviceInterface);
         if (g_postfx_alpha_fix) {
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETRENDERTARGET,
-                       (void *)hook_SetRenderTarget, &g_orig_setrendertarget);
             patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETRENDERSTATE,
                        (void *)hook_SetRenderState, &g_orig_setrenderstate);
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETTEXTURE,
-                       (void *)hook_SetTexture, &g_orig_settexture);
-            capture_backbuffer(*ppReturnedDeviceInterface);
             logf_("PostFilterAlphaFix: armed (RT texture -> backbuffer "
                   "SRCALPHA composites use ONE)");
         }
@@ -1165,20 +1619,23 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
             patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CREATEVB,
                        (void *)hook_CreateVertexBuffer, &g_orig_createvb);
         }
-        if (g_drawstats || g_postfx_alpha_fix) {
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWPRIM,
-                       (void *)hook_DrawPrimitive, &g_orig_drawprim);
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWINDEXPRIM,
-                       (void *)hook_DrawIndexedPrimitive, &g_orig_drawindexprim);
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWPRIMUP,
-                       (void *)hook_DrawPrimitiveUP, &g_orig_drawprimup);
-            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWINDEXPRIMUP,
-                       (void *)hook_DrawIndexedPrimitiveUP,
-                       &g_orig_drawindexprimup);
-            if (g_drawstats)
-                logf_("DRAWSTATS: draw/lock probe armed (window=%d frames)",
-                      DRAWSTATS_WINDOW);
-        }
+        /* Draw entrypoints are always wrapped: DRAWSTATS and the postfx
+         * alpha fix use them opportunistically, and the UIScale RHW rescale
+         * needs them (plus the current FVF) whenever it is active. */
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWPRIM,
+                   (void *)hook_DrawPrimitive, &g_orig_drawprim);
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWINDEXPRIM,
+                   (void *)hook_DrawIndexedPrimitive, &g_orig_drawindexprim);
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWPRIMUP,
+                   (void *)hook_DrawPrimitiveUP, &g_orig_drawprimup);
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_DRAWINDEXPRIMUP,
+                   (void *)hook_DrawIndexedPrimitiveUP,
+                   &g_orig_drawindexprimup);
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETVSHADER,
+                   (void *)hook_SetVertexShader, &g_orig_setvshader);
+        if (g_drawstats)
+            logf_("DRAWSTATS: draw/lock probe armed (window=%d frames)",
+                  DRAWSTATS_WINDOW);
         for (int i = 0; i < g_n_hooks; i++)
             if (g_hooks[i].on_device)
                 g_hooks[i].on_device(*ppReturnedDeviceInterface);
@@ -1443,9 +1900,12 @@ __declspec(dllexport) DWORD WINAPI D3D8GetSWInfo(void)
 __declspec(dllexport) void WINAPI HMC_RegisterD3D8Hooks(
     const HMCD3D8Hooks *hooks)
 {
-    if (!hooks || hooks->version != HMC_D3D8_HOOKS_VERSION) {
-        logf_("HMC_RegisterD3D8Hooks: version mismatch (%u != %u)",
-              hooks ? hooks->version : 0, HMC_D3D8_HOOKS_VERSION);
+    /* v3 structs (no fix_viewport tail) stay accepted: the tail is
+     * zero-filled, so the new callbacks simply never fire for them. */
+    if (!hooks || hooks->version < 3 ||
+        hooks->version > HMC_D3D8_HOOKS_VERSION) {
+        logf_("HMC_RegisterD3D8Hooks: version mismatch (%u, loader speaks "
+              "3..%u)", hooks ? hooks->version : 0, HMC_D3D8_HOOKS_VERSION);
         return;
     }
     if (g_n_hooks >= MAX_HOOKSETS) {
@@ -1453,11 +1913,35 @@ __declspec(dllexport) void WINAPI HMC_RegisterD3D8Hooks(
         return;
     }
     HMCD3D8Hooks *h = &g_hooks[g_n_hooks++];
-    *h = *hooks;
-    logf_("plugin #%d registered D3D8 hooks (fix_present=%p fix_projection=%p "
-          "on_device=%p on_frame=%p on_present=%p)", g_n_hooks,
+    memset(h, 0, sizeof(*h));
+    size_t v3_size = offsetof(HMCD3D8Hooks, fix_viewport);
+    memcpy(h, hooks, hooks->version >= 4 ? sizeof(*h) : v3_size);
+    logf_("plugin #%d registered D3D8 hooks v%u (fix_present=%p "
+          "fix_projection=%p on_device=%p on_frame=%p on_present=%p "
+          "fix_viewport=%p)", g_n_hooks, hooks->version,
           (void *)h->fix_present, (void *)h->fix_projection,
-          (void *)h->on_device, (void *)h->on_frame, (void *)h->on_present);
+          (void *)h->on_device, (void *)h->on_frame, (void *)h->on_present,
+          (void *)h->fix_viewport);
+}
+
+/* UI-scale rendezvous: the widescreen plugin publishes the backbuffer/
+ * believed-resolution ratios here. The loader itself rescales the engine's
+ * post-filter RT creations with kx/ky (hook_CreateTexture); overlay plugins
+ * that draw in real backbuffer pixels multiply their glyph sizes by the
+ * re-exported ky so their text keeps its on-screen size when the backbuffer
+ * grows. 1.0 = UI scaling off. */
+__declspec(dllexport) void WINAPI HMC_SetUIScale(float kx, float ky)
+{
+    if (!(kx >= 0.25f && kx <= 16.0f)) kx = 1.0f;
+    if (!(ky >= 0.25f && ky <= 16.0f)) ky = 1.0f;
+    g_uiscale_kx = kx;
+    g_uiscale_ky = ky;
+    logf_("UI scale published: %.4f/%.4f", (double)kx, (double)ky);
+}
+
+__declspec(dllexport) float WINAPI HMC_GetUIScale(void)
+{
+    return g_uiscale_ky;
 }
 
 /* ---- ASI loading ----------------------------------------------------- */

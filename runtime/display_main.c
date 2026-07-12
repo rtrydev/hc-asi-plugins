@@ -46,6 +46,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         hmc_widescreen_init(inst);
         hmc_profiler_init(inst);
     } else if (reason == DLL_PROCESS_DETACH) {
+        hmc_widescreen_detach();   /* UIScale: undo an engine-saved layout
+                                    * resolution in HitmanContracts.ini */
         hmc_profiler_detach();
     }
     return TRUE;
