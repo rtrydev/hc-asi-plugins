@@ -70,14 +70,10 @@
  *   MouseMotionFix=-1 ; fix the slow-move camera stall by feeding camera motion
  *                   ; from the OS cursor instead of DirectInput's lossy relative
  *                   ; axis (buttons stay on DI): -1 auto (Wine), 0 off, 1 on
- *   UIScale=0       ; N>1: the HitmanContracts.ini Resolution stays the
- *                   ; RENDER resolution and the UI is laid out N x bigger —
- *                   ; the engine's parsed copy of the resolution is patched
- *                   ; in memory to Resolution/N at the first CreateDevice
- *                   ; (see uiscale.c). 0/1 = off (default). -1 (H2SA's
- *                   ; grow-the-backbuffer auto mode) is not supported on
- *                   ; Contracts: this engine re-reads the real device size,
- *                   ; so that decoupling renders the UI at two scales.
+ *   UIScale=0       ; N>1: Resolution stays the RENDER resolution and the UI
+ *                   ; is laid out at Resolution/N. Wine uses a transparent
+ *                   ; startup-parse/grow path; native Windows structurally
+ *                   ; patches the UI settings allocation. 0/1 = off.
  */
 #include <d3d8.h>
 #include <stdio.h>
@@ -139,6 +135,7 @@ static int g_render_w, g_render_h;  /* UIScale>1 re-believed: the
                                      * patched to believe. 0 = not
                                      * re-believed */
 static int g_uiscale_grow;          /* UIScale<-1: ini is layout, bb grows */
+static int g_ini_spoofed;           /* Wine + UIScale>1: disk briefly layout */
 static int g_mode_w, g_mode_h;      /* adapter display mode (physical pixels;
                                      * on Retina = 2x the logical desktop) */
 static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
@@ -290,6 +287,69 @@ static void read_game_resolution(void)
     fclose(f);
 }
 
+static int rewrite_game_resolution(int from_w, int from_h, int to_w, int to_h)
+{
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\..\\HitmanContracts.ini", g_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char out[8192], line[512];
+    size_t o = 0;
+    int changed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        int w = 0, h = 0;
+        if (_strnicmp(p, "Resolution", 10) == 0 &&
+            sscanf(p + 10, " %dx%d", &w, &h) == 2 &&
+            w == from_w && h == from_h) {
+            snprintf(line, sizeof(line), "Resolution %dx%d\n", to_w, to_h);
+            changed = 1;
+        }
+        size_t l = strlen(line);
+        if (o + l >= sizeof(out)) { changed = 0; break; }
+        memcpy(out + o, line, l); o += l;
+    }
+    fclose(f);
+    if (!changed) return 0;
+    f = fopen(path, "w");
+    if (!f) return 0;
+    fwrite(out, 1, o, f);
+    fclose(f);
+    return 1;
+}
+
+/* Under Wine, make the engine naturally parse the layout resolution while
+ * keeping the user's persistent Resolution as the render resolution. The
+ * proxy/ASI loads before the executable parses its ini; fix_present restores
+ * the file before creating D3D. This reproduces fast grow mode without asking
+ * users to coordinate two settings. */
+static void prepare_wine_positive_grow(void)
+{
+    if (!is_wine() || g_uiscale_cfg <= 1.0f || !g_ini_w || !g_ini_h) return;
+    int rw = g_ini_w, rh = g_ini_h;
+    int lw = (int)(lround((double)rw / g_uiscale_cfg / 2.0) * 2);
+    int lh = (int)(lround((double)rh / g_uiscale_cfg / 2.0) * 2);
+    if (lw < 320 || lh < 200) return;
+    if (!rewrite_game_resolution(rw, rh, lw, lh)) return;
+    g_render_w = rw; g_render_h = rh;
+    g_ini_w = lw; g_ini_h = lh;
+    g_uiscale_grow = 1;
+    g_ini_spoofed = 1;
+    logf_("UIScale=%.2f on Wine: engine ini parse temporarily %dx%d; "
+          "persistent/render resolution remains %dx%d",
+          (double)g_uiscale_cfg, lw, lh, rw, rh);
+}
+
+static void restore_spoofed_ini(void)
+{
+    if (!g_ini_spoofed) return;
+    if (rewrite_game_resolution(g_ini_w, g_ini_h, g_render_w, g_render_h))
+        logf_("HitmanContracts.ini restored to render resolution %dx%d",
+              g_render_w, g_render_h);
+    g_ini_spoofed = 0;
+}
+
 /* UIScale re-believe drift guard, called at process detach: if the engine
  * saved its (patched) layout resolution back into HitmanContracts.ini on
  * exit, put the render resolution back — otherwise the next launch would
@@ -297,6 +357,7 @@ static void read_game_resolution(void)
  * in-game switch changed it) is left alone. */
 static void restore_ini_resolution(void)
 {
+    restore_spoofed_ini();
     if (g_uiscale_grow) return; /* ini intentionally remains layout-sized */
     if (!g_render_w || !g_render_h) return;
     char path[MAX_PATH];
@@ -1660,6 +1721,7 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
                         int is_reset)
 {
     if (!g_enabled) return;
+    restore_spoofed_ini();
     int was_fullscreen = !pp->Windowed;
 
     /* The engine picks its backbuffer format ONCE, at boot (ColorDepth 32 ->
@@ -2170,6 +2232,7 @@ void hmc_widescreen_init(HINSTANCE inst)
     if (sl) *sl = 0;
     read_config();
     read_game_resolution();
+    prepare_wine_positive_grow();
     /* Try the opportunistic resolution-snap patch. The renderer is inside
      * HitmanContracts.exe, mapped from process start, so this resolves
      * synchronously (and, when the signature is absent for this build,

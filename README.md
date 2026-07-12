@@ -300,18 +300,18 @@ resolution, so without `UIScale` the UI-size knob is the `Resolution` line —
 a smaller resolution = a proportionally bigger UI, coupled with a softer 3D
 image (the backbuffer is pinned to it).
 
-`UIScale=-N` (N>1) uses the performant **grow mode**, shared with the sibling
-[h2sa-asi-plugins](https://github.com/rtrydev/h2sa-asi-plugins): the
-`HitmanContracts.ini Resolution` is the UI-layout size and the plugin grows
-only the render backbuffer by N. For example, `Resolution 1280x800` plus
-`UIScale=-2` renders at 2560x1600 with a 1280x800-sized UI. Only the handful
-of layout-space viewports are expanded; per-draw RHW/UV interception stays
-disabled. This avoids the 15–30 FPS D3DMetal penalty caused by changing the
-renderer-visible live resolution or transforming buffers on every draw.
+`UIScale=N` (N>1) has the same convention everywhere: `Resolution` is always
+the render resolution and the UI is laid out at `Resolution/N`. For example,
+`Resolution 2560x1600` plus `UIScale=2` renders at 2560x1600 with a
+1280x800-sized UI.
 
-`UIScale=N` (>1) remains as a legacy compatibility mode: the ini stays the
-render resolution and the plugin selectively re-believes the UI-owned parsed
-copy to `Resolution/N`. Grow mode is recommended on CrossOver/macOS.
+The implementation is platform-specific but hidden from configuration. On
+Wine/CrossOver the plugin briefly supplies the divided resolution during the
+engine's startup parse, restores `HitmanContracts.ini` before D3D creation,
+then uses the fast viewport-only grow path. On native Windows it structurally
+identifies and patches the UI settings allocation. This avoids the 15–30 FPS
+D3DMetal penalty from per-draw RHW/UV interception while keeping one portable
+configuration.
 
 Two Contracts-specific differences from H2SA:
 
@@ -320,8 +320,8 @@ Two Contracts-specific differences from H2SA:
   the engine has parsed its ini (H2SA's plugins load from inside the
   engine's `LoadLibrary(RenderD3D.dll)`, after the parse). The device does
   not exist yet at that point, so no device-derived copies can false-match.
-- `UIScale=-1` auto mode is not supported; use an explicit grow factor such
-  as `-2` so the render target is deterministic.
+- Negative factors are retained for backward compatibility with the earlier
+  explicit grow-mode configuration; positive factors are recommended.
 
 While re-believed, the in-game resolution switch is locked for the session
 (the engine's patched belief cannot be re-pointed mid-run; a switch is
@@ -404,9 +404,8 @@ RainSystemCap=0     ; rain CPU limiter, systems per frame; 0 = off
 ForceWinMouse=-1    ; mouse buttons fix: -1 auto (on under Wine), 0 off, 1 on
 MouseClipFix=-1     ; mouse-look edge-wall fix: -1 auto, 0 off, 1 on
 MouseMotionFix=-1   ; slow-move stall fix: -1 auto, 0 off, 1 on
-UIScale=0           ; -N (N>1, recommended) = ini Resolution is the UI layout
-                    ; and the backbuffer grows N x; N>1 = legacy re-believe;
-                    ; 0/1 = off; -1 auto is not supported
+UIScale=0           ; N>1 = render at ini Resolution, UI laid out at
+                    ; Resolution/N; 0/1 = off
 UIScalePostFilter=1 ; keep the post-filter under UIScale (default); 0 =
                     ; force PostFilterLOD 0 in memory instead (fallback)
 UIScaleStrict2D=1   ; only rescale true 2D-layer draws (rhw==1, z in 0..1,

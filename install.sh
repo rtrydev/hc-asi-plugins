@@ -79,8 +79,8 @@ if [ ! -f "$GAME/scripts/hmc_display.ini" ]; then
     fi
 fi
 if ! grep -q '^[[:space:]]*UIScale' "$GAME/scripts/hmc_display.ini"; then
-    # Surface UIScale, off by default. Recommended: -N (N>1) treats the game
-    # Resolution as UI layout size and grows the render backbuffer N x.
+    # Surface UIScale, off by default. N>1 keeps Resolution as the render
+    # resolution and lays the UI out at Resolution/N on every platform.
     awk '{ print } /^\[display\]/ || /^\[widescreen\]/ { print "UIScale=0" }' \
         "$GAME/scripts/hmc_display.ini" > "$GAME/scripts/hmc_display.ini.tmp" \
         && mv "$GAME/scripts/hmc_display.ini.tmp" "$GAME/scripts/hmc_display.ini"
