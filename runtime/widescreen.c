@@ -255,7 +255,10 @@ static void read_config(void)
     if (g_uiscale_cfg < -8.0f) g_uiscale_cfg = -8.0f;
     else if (g_uiscale_cfg > 8.0f) g_uiscale_cfg = 8.0f;
     if (!g_uiscale_patchmask_set)
-        g_uiscale_patchmask = is_wine() ? 0x04u : 0x1cu;
+        /* Candidate ordering differs between Wine and native D3D8. Native
+         * UI layout is owned by candidates 9..13; including the neighbouring
+         * renderer copies restores the old frame-rate penalty. */
+        g_uiscale_patchmask = is_wine() ? 0x04u : 0x3e00u;
     hmc_uiscale_config(g_uiscale_cfg);
     hmc_uiscale_patchmask(g_uiscale_patchmask);
 }
