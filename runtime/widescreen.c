@@ -156,6 +156,11 @@ static int install_ini_virtualization(int rw, int rh, int lw, int lh);
 /* uiscale.c hook (D3D-typed, so declared here rather than hmc_plugin.h) */
 void hmc_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned int bbw,
                               unsigned int bbh);
+/* [display] UIScalePhaseSplit: hold the re-believed resolution at the REAL
+ * value across the 3D pass and at the layout value only for the 2D layer, so
+ * the engine's screen-space cull metric stops dropping geometry. Default on;
+ * 0 restores the permanently-divided behaviour. */
+static int g_uiscale_phasesplit = 1;
 static volatile DWORD g_fg_deadline; /* startup-activation window still open */
 static volatile DWORD g_next_kick;   /* earliest tick for the next kick */
 static volatile int g_kicks_left;    /* remaining startup activation kicks */
@@ -243,6 +248,9 @@ static void read_config(void)
         else if (sscanf(line, " UIScalePostFilter = %d", &b) == 1 ||
                  sscanf(line, " UIScalePostFilter=%d", &b) == 1)
             g_uiscale_postfx = (b != 0);
+        else if (sscanf(line, " UIScalePhaseSplit = %d", &b) == 1 ||
+                 sscanf(line, " UIScalePhaseSplit=%d", &b) == 1)
+            g_uiscale_phasesplit = (b != 0);
     }
     fclose(f);
     if (g_backbuffers < 0 || g_backbuffers > 3) g_backbuffers = 2;
@@ -257,6 +265,7 @@ static void read_config(void)
         g_uiscale_patchmask = 0;
     hmc_uiscale_config(g_uiscale_cfg);
     hmc_uiscale_patchmask(g_uiscale_patchmask);
+    hmc_uiscale_phase_split(g_uiscale_phasesplit);
 }
 
 /* Parse "Resolution WxH" from HitmanContracts.ini in the game root (the parent of
@@ -2284,6 +2293,7 @@ static const HMCD3D8Hooks g_hooks = {
     frame_limit,    /* on_present */
     NULL,           /* on_frame */
     hmc_uiscale_fix_viewport,  /* believed-space viewports -> backbuffer */
+    hmc_uiscale_phase,         /* 3D pass = real res, 2D pass = layout res */
 };
 
 void hmc_widescreen_init(HINSTANCE inst)

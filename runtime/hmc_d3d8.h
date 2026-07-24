@@ -23,7 +23,7 @@
 
 #include <d3d8.h>
 
-#define HMC_D3D8_HOOKS_VERSION 4
+#define HMC_D3D8_HOOKS_VERSION 5
 
 typedef struct HMCD3D8Hooks {
     unsigned int version;   /* set to HMC_D3D8_HOOKS_VERSION */
@@ -71,6 +71,19 @@ typedef struct HMCD3D8Hooks {
      * backbuffer is larger, so the plugin rescales them here. bbw/bbh are the
      * live backbuffer size. */
     void (*fix_viewport)(D3DVIEWPORT8 *vp, unsigned int bbw, unsigned int bbh);
+
+    /* ---- version 5 field ---- */
+
+    /* Optional (may be NULL): the loader reports which phase of the frame the
+     * engine is in — 0 while it is traversing and drawing the 3D scene, 1 once
+     * it has moved on to the pre-transformed 2D layer (post-filter composite,
+     * HUD, menus). UIScale uses it to hold the re-believed resolution at the
+     * REAL value across the 3D pass and at the LAYOUT value only for the 2D
+     * pass: the engine derives its screen-space cull/LOD metric from the same
+     * field the UI layout comes from, so a permanently divided value makes the
+     * engine drop ~10% of the scene as "too small on screen". Called on the
+     * game thread, at most twice per frame, only while UIScale is active. */
+    void (*set_ui_phase)(int layout_phase);
 } HMCD3D8Hooks;
 
 /* Multiple plugins may register; the loader keeps every hook set and invokes

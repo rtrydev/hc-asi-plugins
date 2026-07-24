@@ -30,6 +30,11 @@ float hmc_uiscale_cfg(void);
 int   hmc_uiscale_wanted(void);
 int   hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh);
 int   hmc_uiscale_reassert(void);
+/* Temporal split: assert the REAL render resolution across the engine's 3D
+ * pass (layout_phase 0) and the divided layout resolution only for its 2D
+ * layer (layout_phase 1). Driven by the loader's v5 set_ui_phase hook. */
+void  hmc_uiscale_phase(int layout_phase);
+void  hmc_uiscale_phase_split(int on);
 int   hmc_uiscale_force_lod0(void);
 void  hmc_uiscale_setup(int ini_w, int ini_h,
                         unsigned bb_w, unsigned bb_h);

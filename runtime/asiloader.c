@@ -48,10 +48,12 @@
 #define IDX_DEV_CREATERENDERTGT 25
 #define IDX_DEV_CREATEIMAGESURF 27
 #define IDX_DEV_SETRENDERTARGET 31
+#define IDX_DEV_CLEAR           36
 #define IDX_DEV_SETTRANSFORM    37
 #define IDX_DEV_SETVIEWPORT     40
 #define IDX_DEV_SETRENDERSTATE  50
 #define IDX_DEV_SETTEXTURE      61
+#define IDX_DEV_SETTEXSTAGESTATE 63
 #define IDX_DEV_DRAWPRIM        70
 #define IDX_DEV_DRAWINDEXPRIM   71
 #define IDX_DEV_DRAWPRIMUP      72
@@ -60,6 +62,11 @@
 /* IDirect3DVertexBuffer8: IUnknown(0..2) + IDirect3DResource8(3..10) + Lock(11) */
 #define IDX_VB_LOCK             11
 #define IDX_VB_UNLOCK           12
+/* IDirect3DBaseTexture8::GetType, and IDirect3DTexture8::GetLevelDesc (the
+ * first method the 2D-texture interface adds after the base texture's
+ * SetLOD/GetLOD/GetLevelCount). */
+#define IDX_TEX_GETTYPE         10
+#define IDX_TEX_GETLEVELDESC    14
 
 static FILE *g_log;
 static char g_dir[MAX_PATH];        /* game directory (location of this dll) */
@@ -149,6 +156,140 @@ static DWORD g_srcblend = D3DBLEND_ONE;
 static unsigned int g_postfx_alpha_hits;
 static unsigned int g_postfx_probe_logs;
 
+/* ---- render census (scripts/RENDERCENSUS marker or HMC_RENDERCENSUS=1) --
+ * Aggregated, allocation-free per-frame instrumentation used to settle WHICH
+ * mechanism a visibility bug comes from, without needing to reach the spot
+ * in-game. Three independent censuses, each a small fixed bucket table logged
+ * every CENSUS_WINDOW frames:
+ *   BLEND — (srcblend, destblend, alphablend) x bound-render-target format.
+ *           A ground/detail pass that reads DESTINATION ALPHA shows up here,
+ *           together with whether the target it runs against actually HAS an
+ *           alpha channel (the whole see-through-texture bug class).
+ *   RHW   — how the UIScale classifier ruled on every pre-transformed draw
+ *           (scaled / rejected and why), bucketed by vertex count + FVF with
+ *           the accumulated screen bounds. World geometry being rescaled as
+ *           if it were the 2D layer shows up as a big-vertex-count scaled
+ *           bucket.
+ *   RT    — every distinct render target bound, with size and format.
+ * Off by default; when off the draw path takes one already-present branch. */
+#define CENSUS_WINDOW 300
+static int g_census;
+static DWORD g_destblend = D3DBLEND_ZERO;
+static D3DFORMAT g_rt_fmt;        /* format of the bound render target */
+static D3DFORMAT g_bb_fmt;        /* backbuffer format, from CreateDevice */
+static unsigned g_census_frames;
+
+#define MAX_CENSUS 96
+typedef struct { DWORD src, dst; int ab; D3DFORMAT fmt; int bb; unsigned n; }
+    BlendBucket;
+static BlendBucket g_c_blend[MAX_CENSUS];
+static int g_n_c_blend;
+
+/* verdict: 0 scaled, 1 rejected (device-space bounds), 2 rejected (projected:
+ * rhw/z not the 2D layer), 3 rejected (stride != FVF size) */
+typedef struct {
+    int verdict, pos, uv;
+    UINT verts;
+    DWORD fvf;
+    float x0, y0, x1, y1;
+    unsigned n;
+} RhwBucket;
+static RhwBucket g_c_rhw[MAX_CENSUS];
+static int g_n_c_rhw;
+
+typedef struct { UINT w, h; D3DFORMAT fmt; int bb; unsigned n; } RtBucket;
+static RtBucket g_c_rt[MAX_CENSUS];
+static int g_n_c_rt;
+
+/* Draws that SAMPLE a render-target texture — the population PostFilterAlphaFix
+ * rewrites. Bucketed by the sampled RT's size and the blend it is composited
+ * with, so a character-shadow/reflection quad (a small RT texture blended
+ * SRCALPHA/INVSRCALPHA) is distinguishable from a post-filter composite. */
+typedef struct {
+    UINT tw, th;
+    DWORD src, dst;
+    int ab, bb, rewritten;
+    unsigned n;
+} RtTexBucket;
+static RtTexBucket g_c_rttex[MAX_CENSUS];
+static int g_n_c_rttex;
+
+static void census_rttex_hit(int rewritten)
+{
+    for (int i = 0; i < g_n_c_rttex; i++) {
+        RtTexBucket *b = &g_c_rttex[i];
+        if (b->tw == g_stage0_rt_w && b->th == g_stage0_rt_h &&
+            b->src == g_srcblend && b->dst == g_destblend &&
+            b->ab == g_alpha_blend && b->bb == g_rt_is_backbuffer &&
+            b->rewritten == rewritten) { b->n++; return; }
+    }
+    if (g_n_c_rttex >= MAX_CENSUS) return;
+    g_c_rttex[g_n_c_rttex++] = (RtTexBucket){ g_stage0_rt_w, g_stage0_rt_h,
+        g_srcblend, g_destblend, g_alpha_blend, g_rt_is_backbuffer,
+        rewritten, 1 };
+}
+
+static void census_blend_hit(void)
+{
+    D3DFORMAT fmt = g_rt_is_backbuffer ? g_bb_fmt : g_rt_fmt;
+    for (int i = 0; i < g_n_c_blend; i++) {
+        BlendBucket *b = &g_c_blend[i];
+        if (b->src == g_srcblend && b->dst == g_destblend &&
+            b->ab == g_alpha_blend && b->fmt == fmt &&
+            b->bb == g_rt_is_backbuffer) { b->n++; return; }
+    }
+    if (g_n_c_blend >= MAX_CENSUS) return;
+    g_c_blend[g_n_c_blend++] = (BlendBucket){ g_srcblend, g_destblend,
+        g_alpha_blend, fmt, g_rt_is_backbuffer, 1 };
+}
+
+static void census_rt_hit(UINT w, UINT h, D3DFORMAT fmt, int bb)
+{
+    for (int i = 0; i < g_n_c_rt; i++) {
+        RtBucket *r = &g_c_rt[i];
+        if (r->w == w && r->h == h && r->fmt == fmt && r->bb == bb) {
+            r->n++; return;
+        }
+    }
+    if (g_n_c_rt >= MAX_CENSUS) return;
+    g_c_rt[g_n_c_rt++] = (RtBucket){ w, h, fmt, bb, 1 };
+}
+
+static void census_rhw_hit(int verdict, int pos, int uv, UINT verts,
+                           DWORD fvf, const void *v0, UINT stride, UINT first,
+                           UINT count)
+{
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    const uint8_t *p = (const uint8_t *)v0 + (size_t)first * stride;
+    for (UINT i = 0; i < count && i < 65536; i++, p += stride) {
+        float xy[2];
+        memcpy(xy, p, 8);
+        if (xy[0] < x0) x0 = xy[0];
+        if (xy[0] > x1) x1 = xy[0];
+        if (xy[1] < y0) y0 = xy[1];
+        if (xy[1] > y1) y1 = xy[1];
+    }
+    /* The screen rectangle is part of the bucket key (rounded to 8 px): a
+     * union-of-everything bounding box hides exactly what matters here, which
+     * is that two quads of the same shape and FVF can be ruled on differently
+     * because of where they happen to sit. */
+    for (int i = 0; i < g_n_c_rhw; i++) {
+        RhwBucket *b = &g_c_rhw[i];
+        if (b->verdict == verdict && b->pos == pos && b->uv == uv &&
+            b->verts == verts && b->fvf == fvf &&
+            (int)(b->x0 / 8) == (int)(x0 / 8) &&
+            (int)(b->y0 / 8) == (int)(y0 / 8) &&
+            (int)(b->x1 / 8) == (int)(x1 / 8) &&
+            (int)(b->y1 / 8) == (int)(y1 / 8)) {
+            b->n++;
+            return;
+        }
+    }
+    if (g_n_c_rhw >= MAX_CENSUS) return;
+    g_c_rhw[g_n_c_rhw++] = (RhwBucket){ verdict, pos, uv, verts, fvf,
+                                        x0, y0, x1, y1, 1 };
+}
+
 /* The six post-filter RT-creation call sites (return addresses), in creation
  * order, with the RenderD3D post-object member slot each buffer lands in. Site 0
  * is the quarter-res 480x270 bloom-blur buffer; sites 1-5 are full-res
@@ -173,7 +314,7 @@ static int postfilter_rt_site(uint32_t rva)
 }
 
 
-#define MAX_RT_TEX 64
+#define MAX_RT_TEX 256
 typedef struct { IDirect3DBaseTexture8 *tex; UINT w, h; D3DFORMAT fmt; } RTTex;
 static RTTex g_rt_tex[MAX_RT_TEX];
 static int g_n_rt_tex;
@@ -300,18 +441,71 @@ static void remember_rt_texture(IDirect3DBaseTexture8 *tex, UINT w, UINT h,
             return;
         }
     }
-    int i = g_n_rt_tex < MAX_RT_TEX ? g_n_rt_tex++ : 0;
+    /* Never clobber slot 0 when full: an entry that keeps being overwritten
+     * still matches by POINTER later (see rt_texture_is_live), and a wrong
+     * match is what misclassifies a draw. Dropping the newest instead only
+     * costs a missed optimisation, never a wrong one. */
+    if (g_n_rt_tex >= MAX_RT_TEX) return;
+    int i = g_n_rt_tex++;
     g_rt_tex[i].tex = tex;
     g_rt_tex[i].w = w;
     g_rt_tex[i].h = h;
     g_rt_tex[i].fmt = fmt;
 }
 
+/* Ask the texture itself whether it still is the render target we recorded.
+ *
+ * A remembered pointer alone is NOT evidence. The table is filled at
+ * CreateTexture and nothing tells it when a texture is released, so as soon as
+ * the allocator hands the same address to an ordinary texture (routine across a
+ * mission load, and increasingly likely the longer a session runs), a plain
+ * pointer match reports "this draw samples a full-size render target" about a
+ * character/HUD texture. Both consumers of that answer then alter the draw:
+ * the UIScale UV rescale multiplies texture coordinates by k and clamps them to
+ * [0,1] — which collapses a normal 0..1 atlas lookup onto one edge texel, i.e.
+ * a flat single-colour quad — and PostFilterAlphaFix rewrites SRCBLEND to ONE,
+ * which turns an alpha-blended element into an opaque block. Both failure modes
+ * look like "a solid rectangle where the artwork should be".
+ *
+ * D3D8 keeps the level description on the object, so GetLevelDesc is a local
+ * read, not a driver round-trip; it runs only for pointers that already hit the
+ * table (the handful of genuine render-target samples per frame), so the hot
+ * path is unchanged. GetType is checked first: a stale address may now hold a
+ * cube/volume texture, whose vtable has a different method at that slot. */
+static int rt_texture_is_live(RTTex *e)
+{
+    typedef D3DRESOURCETYPE (WINAPI *gt_t)(IDirect3DBaseTexture8 *);
+    typedef HRESULT (WINAPI *gld_t)(IDirect3DTexture8 *, UINT,
+                                    D3DSURFACE_DESC *);
+    void **vtbl = *(void ***)e->tex;
+    if (((gt_t)vtbl[IDX_TEX_GETTYPE])(e->tex) != D3DRTYPE_TEXTURE)
+        return 0;
+    D3DSURFACE_DESC d;
+    if (FAILED(((gld_t)vtbl[IDX_TEX_GETLEVELDESC])(
+                   (IDirect3DTexture8 *)e->tex, 0, &d)))
+        return 0;
+    if (!(d.Usage & D3DUSAGE_RENDERTARGET))
+        return 0;
+    /* A render target really at this address, but a different one than we
+     * recorded: trust the object, not the note. */
+    e->w = d.Width; e->h = d.Height; e->fmt = d.Format;
+    return 1;
+}
+
+static void forget_rt_texture(int i)
+{
+    g_rt_tex[i] = g_rt_tex[--g_n_rt_tex];
+}
+
 static RTTex *find_rt_texture(IDirect3DBaseTexture8 *tex)
 {
     if (!tex) return NULL;
     for (int i = 0; i < g_n_rt_tex; i++)
-        if (g_rt_tex[i].tex == tex) return &g_rt_tex[i];
+        if (g_rt_tex[i].tex == tex) {
+            if (rt_texture_is_live(&g_rt_tex[i])) return &g_rt_tex[i];
+            forget_rt_texture(i);
+            return NULL;
+        }
     return NULL;
 }
 
@@ -531,6 +725,85 @@ static HRESULT WINAPI hook_CreateImageSurface(IDirect3DDevice8 *self, UINT W,
     return ((ci_t)g_orig_createimagesurf)(self, W, H, Fmt, pp);
 }
 
+/* Census only: report every Clear that carries explicit rectangles, with the
+ * bound target's size. A sub-rect Clear is how an engine paints cinematic
+ * letterbox bars, and its rectangles are DEVICE pixels — so if the engine
+ * computed them from a re-believed (UIScale) resolution they land on the wrong
+ * part of a bigger backbuffer. */
+static void *g_orig_clear;
+static void *g_orig_settexstagestate;
+static DWORD g_stage0_texflags;    /* D3DTSS_TEXTURETRANSFORMFLAGS, stage 0 */
+static DWORD g_stage0_texcoordidx; /* D3DTSS_TEXCOORDINDEX, stage 0 */
+static D3DMATRIX g_tex_matrix[8];
+
+/* Census: every distinct PROJECTED-texture draw (a texture transform is
+ * active on stage 0), with the stage-0 texture matrix that generates its
+ * coordinates. This is the population a puddle/reflection lives in. */
+static void census_projtex(DWORD fvf)
+{
+    static struct { DWORD fvf, flags, idx; float m00, m11, m20, m21, m30,
+                    m31; int is3d, rt; UINT tw, th; } seen[24];
+    static int n;
+    const D3DMATRIX *m = &g_tex_matrix[0];
+    int is3d = (fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW;
+    for (int i = 0; i < n; i++)
+        if (seen[i].fvf == fvf && seen[i].flags == g_stage0_texflags &&
+            seen[i].idx == g_stage0_texcoordidx && seen[i].m00 == m->_11 &&
+            seen[i].m11 == m->_22 && seen[i].m30 == m->_41 &&
+            seen[i].m31 == m->_42 && seen[i].tw == g_stage0_rt_w)
+            return;
+    if (n >= (int)(sizeof(seen) / sizeof(seen[0]))) return;
+    seen[n].fvf = fvf; seen[n].flags = g_stage0_texflags;
+    seen[n].idx = g_stage0_texcoordidx; seen[n].m00 = m->_11;
+    seen[n].m11 = m->_22; seen[n].m20 = m->_31; seen[n].m21 = m->_32;
+    seen[n].m30 = m->_41; seen[n].m31 = m->_42; seen[n].is3d = is3d;
+    seen[n].rt = g_stage0_is_rttex; seen[n].tw = g_stage0_rt_w;
+    seen[n].th = g_stage0_rt_h;
+    n++;
+    logf_("PROJTEX %s fvf=0x%lx flags=0x%lx idx=0x%lx rttex=%d(%ux%u) "
+          "texmat[_11=%.6g _22=%.6g _31=%.6g _32=%.6g _41=%.6g _42=%.6g "
+          "_33=%.6g _34=%.6g]", is3d ? "3D" : "RHW", (unsigned long)fvf,
+          (unsigned long)g_stage0_texflags, (unsigned long)g_stage0_texcoordidx,
+          g_stage0_is_rttex, g_stage0_rt_w, g_stage0_rt_h,
+          m->_11, m->_22, m->_31, m->_32, m->_41, m->_42, m->_33, m->_34);
+}
+
+static HRESULT WINAPI hook_SetTextureStageState(IDirect3DDevice8 *self,
+    DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value)
+{
+    typedef HRESULT (WINAPI *ss_t)(IDirect3DDevice8 *, DWORD,
+        D3DTEXTURESTAGESTATETYPE, DWORD);
+    if (Stage == 0) {
+        if (Type == D3DTSS_TEXTURETRANSFORMFLAGS) g_stage0_texflags = Value;
+        else if (Type == D3DTSS_TEXCOORDINDEX)    g_stage0_texcoordidx = Value;
+    }
+    return ((ss_t)g_orig_settexstagestate)(self, Stage, Type, Value);
+}
+
+static HRESULT WINAPI hook_Clear(IDirect3DDevice8 *self, DWORD Count,
+    CONST D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
+{
+    typedef HRESULT (WINAPI *cl_t)(IDirect3DDevice8 *, DWORD, CONST D3DRECT *,
+        DWORD, D3DCOLOR, float, DWORD);
+    if (g_census && Count && pRects) {
+        static int logs;
+        if (logs < 24) {
+            logs++;
+            logf_("CLEAR %lu rect(s) flags=0x%lx colour=0x%08lx on %s %ux%u:"
+                  " [%ld,%ld..%ld,%ld]%s", (unsigned long)Count,
+                  (unsigned long)Flags, (unsigned long)Color,
+                  g_rt_is_backbuffer ? "backbuffer" : "rt", g_rt_w, g_rt_h,
+                  (long)pRects[0].x1, (long)pRects[0].y1, (long)pRects[0].x2,
+                  (long)pRects[0].y2, Count > 1 ? " ..." : "");
+            for (DWORD i = 1; i < Count && i < 4; i++)
+                logf_("      rect%lu [%ld,%ld..%ld,%ld]", (unsigned long)i,
+                      (long)pRects[i].x1, (long)pRects[i].y1,
+                      (long)pRects[i].x2, (long)pRects[i].y2);
+        }
+    }
+    return ((cl_t)g_orig_clear)(self, Count, pRects, Flags, Color, Z, Stencil);
+}
+
 static HRESULT WINAPI hook_SetRenderTarget(IDirect3DDevice8 *self,
     IDirect3DSurface8 *rt, IDirect3DSurface8 *zs)
 {
@@ -539,6 +812,8 @@ static HRESULT WINAPI hook_SetRenderTarget(IDirect3DDevice8 *self,
     g_rt_is_backbuffer = (!rt || (g_backbuffer && rt == g_backbuffer));
     if (g_rt_is_backbuffer) {
         g_rt_w = g_bbw; g_rt_h = g_bbh;
+        g_rt_fmt = g_bb_fmt;
+        if (g_census) census_rt_hit(g_bbw, g_bbh, g_bb_fmt, 1);
     } else {
         /* remember the offscreen target's size: a full-backbuffer-sized RT
          * is a believed-space canvas for the UIScale rescale (the engine
@@ -547,10 +822,11 @@ static HRESULT WINAPI hook_SetRenderTarget(IDirect3DDevice8 *self,
             D3DSURFACE_DESC *);
         D3DSURFACE_DESC sd;
         if (SUCCEEDED(((gd_t)(*(void ***)rt)[8])(rt, &sd))) {
-            g_rt_w = sd.Width; g_rt_h = sd.Height;
+            g_rt_w = sd.Width; g_rt_h = sd.Height; g_rt_fmt = sd.Format;
         } else {
-            g_rt_w = g_rt_h = 0;
+            g_rt_w = g_rt_h = 0; g_rt_fmt = D3DFMT_UNKNOWN;
         }
+        if (g_census) census_rt_hit(g_rt_w, g_rt_h, g_rt_fmt, 0);
     }
     return ((srt_t)g_orig_setrendertarget)(self, rt, zs);
 }
@@ -570,6 +846,7 @@ static HRESULT WINAPI hook_SetRenderState(IDirect3DDevice8 *self,
         DWORD);
     if (State == D3DRS_ALPHABLENDENABLE) g_alpha_blend = Value != 0;
     else if (State == D3DRS_SRCBLEND) g_srcblend = Value;
+    else if (State == D3DRS_DESTBLEND) g_destblend = Value;
     return ((srs_t)g_orig_setrenderstate)(self, State, Value);
 }
 
@@ -613,6 +890,40 @@ static HRESULT postfx_alpha_draw(IDirect3DDevice8 *self, void *ret,
     HRESULT hr = drawfn(ctx);
     setrs(self, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
     return hr;
+}
+
+/* ---- frame-phase tracking (drives the v5 set_ui_phase hook) -----------
+ *
+ * The engine reads one re-believed value both to lay the 2D layer out and to
+ * derive the screen-space size it culls geometry by, so UIScale has to give it
+ * a different answer in each half of the frame. Split point: the engine draws
+ * the 3D scene with transformed (non-RHW) vertices and everything after it —
+ * post-filter composite, HUD, menus — with pre-transformed RHW ones. So the 2D
+ * phase begins at the first RHW draw that FOLLOWS a 3D draw; a leading RHW
+ * backdrop cannot trip it early, and a frame with no 3D at all (menus) stays in
+ * the layout phase throughout, which is what a menu wants. Present ends the
+ * frame and hands the real resolution back for the next traversal. */
+static int g_phase_3d_seen;      /* a 3D draw has happened this frame */
+static int g_phase_is_layout = 1;
+
+static void set_ui_phase(int layout)
+{
+    if (layout == g_phase_is_layout) return;
+    g_phase_is_layout = layout;
+    for (int i = 0; i < g_n_hooks; i++)
+        if (g_hooks[i].set_ui_phase)
+            g_hooks[i].set_ui_phase(layout);
+}
+
+static void phase_note_draw(void)
+{
+    if (g_in_overlay) return;
+    if ((g_cur_fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW) {
+        g_phase_3d_seen = 1;
+        set_ui_phase(0);              /* 3D pass: the real render resolution */
+    } else if (g_phase_3d_seen) {
+        set_ui_phase(1);              /* 2D layer: the layout resolution */
+    }
 }
 
 static void drawsite_hit(void *ret, int is_up)
@@ -788,6 +1099,30 @@ static HRESULT timed_draw(IDirect3DDevice8 *self, void *ret,
         drawsite_hit(ret, is_up);
         QueryPerformanceCounter(&a);
     }
+    phase_note_draw();
+    if (g_census) {
+        census_blend_hit();
+        if (g_stage0_texflags) census_projtex(g_cur_fvf);
+        if (g_stage0_is_rttex) {
+            census_rttex_hit(postfx_alpha_active());
+            /* How does a draw that samples a FULL-SIZE render target get its
+             * texture coordinates? If it is 3D geometry using a projected
+             * texture matrix, the loader's RHW-only UV rescale cannot reach
+             * it — and under UIScale the RT holds scaled content while the
+             * engine addresses it in believed pixels. */
+            static int logs;
+            if (g_bbw && g_stage0_rt_w == g_bbw && g_stage0_rt_h == g_bbh &&
+                !g_rt_is_backbuffer && logs < 12) {
+                logs++;
+                logf_("RTSAMPLE fvf=0x%lx texflags=0x%lx texcoordidx=0x%lx "
+                      "target=%s %ux%u", (unsigned long)g_cur_fvf,
+                      (unsigned long)g_stage0_texflags,
+                      (unsigned long)g_stage0_texcoordidx,
+                      g_rt_is_backbuffer ? "backbuffer" : "rt",
+                      g_rt_w, g_rt_h);
+            }
+        }
+    }
     if (g_postfx_alpha_fix && g_stage0_is_rttex && g_postfx_probe_logs < 24) {
         uint8_t *base = (uint8_t *)GetModuleHandleA(NULL);
         logf_("PostFilterAlphaFix probe: RT texture draw at exe+0x%tx "
@@ -937,10 +1272,11 @@ static void scale_rhw_verts(void *verts, UINT stride, UINT first, UINT count,
 
 /* Is this vertex range a believed-(layout-)space 2D emission? Only those may
  * be rescaled; everything else is left alone:
- *  - coordinates past the layout bounds are DEVICE space — a few RHW
- *    emitters size their quads from the REAL display (the intro-video
- *    player reads the display mode, which is deliberately not patched), and
- *    scaling those again pushes them off-screen;
+ *  - geometry that reaches the DEVICE extents is device space — a few RHW
+ *    emitters size their quads from the REAL display (the intro-video player
+ *    reads the display mode, which is deliberately not patched; so do the
+ *    post-filter's full-screen blits), and scaling those again pushes them
+ *    off-screen;
  *  - (strict, default) vertices whose rhw is not exactly ~1 or whose z is
  *    outside [0,1] are not the engine's pre-transformed 2D layer — they are
  *    software-PROJECTED geometry (rhw = 1/w) that merely happens to lie
@@ -949,15 +1285,35 @@ static void scale_rhw_verts(void *verts, UINT stride, UINT first, UINT count,
  *    detail-blend regression);
  *  - (strict, default) a stream stride different from the tracked FVF's
  *    vertex size means the FVF latch is stale for this draw: the position
- *    and UV offsets would read/write the wrong fields. */
+ *    and UV offsets would read/write the wrong fields.
+ *
+ * The device-extent test replaces an earlier "any vertex past the layout
+ * rect is device space" rule, which confused OVERSHOOT with device space.
+ * The engine deliberately over-extends believed-space 2D quads past the
+ * layout rect so they cover regardless of rounding, and the cinematic
+ * letterbox is the case that made it visible: the pair arrives as a top bar
+ * y[0..134] and a bottom bar y[944..2024] against a 1920x1080 layout, so the
+ * top bar scaled and the bottom bar did not — leaving the un-scaled bottom
+ * bar sitting as a 1920x1080 black rectangle in the middle of a 3840x2160
+ * screen, over whoever 47 was talking to. Believed-space content is laid out
+ * on the layout scale and only ever overshoots it; device-space content is
+ * built from the real display and therefore REACHES it. Verified against a
+ * live census: every device-space RHW draw in-game spans to the device edge
+ * (x..3840 / y..2160+), and no believed-space one does. */
+static int g_rhw_reason;   /* census: why the last classification ruled so */
+
 static int rhw_verts_layout_2d(const void *verts, UINT stride, UINT first,
                                UINT count)
 {
-    float lw = (float)g_bbw / g_uiscale_kx + 2.0f;
-    float lh = (float)g_bbh / g_uiscale_ky + 2.0f;
+    /* One pixel of slack each way: a full-screen device quad addresses pixel
+     * centres, so its far edge sits at extent-0.5, not at extent. */
+    float dev_x = (float)g_bbw - 2.0f;
+    float dev_y = (float)g_bbh - 2.0f;
+    g_rhw_reason = 0;
     if (g_uiscale_strict2d) {
         UINT want = fvf_rhw_vertex_size(g_cur_fvf);
         if (stride != want) {
+            g_rhw_reason = 3;
             static int logged;
             if (!logged) {
                 logged = 1;
@@ -972,19 +1328,22 @@ static int rhw_verts_layout_2d(const void *verts, UINT stride, UINT first,
     for (UINT i = 0; i < count; i++, v += stride) {
         float p[4];
         memcpy(p, v, 16);
-        if (p[0] > lw || p[1] > lh) {
+        if (p[0] >= dev_x || p[1] >= dev_y) {
+            g_rhw_reason = 1;
             static int logged;
             if (!logged) {
                 logged = 1;
                 logf_("UIScale: device-space RHW draw left unscaled "
-                      "(x=%.1f y=%.1f > layout %.0fx%.0f — e.g. the video "
-                      "player)", p[0], p[1], (double)lw, (double)lh);
+                      "(x=%.1f y=%.1f reaches the %ux%u device extent — e.g. "
+                      "the video player or a post-filter blit)", p[0], p[1],
+                      g_bbw, g_bbh);
             }
             return 0;
         }
         if (g_uiscale_strict2d &&
             !(p[2] >= -0.001f && p[2] <= 1.001f &&
               p[3] >= 0.999f && p[3] <= 1.001f)) {   /* NaN fails too */
+            g_rhw_reason = 2;
             static int logged;
             if (!logged) {
                 logged = 1;
@@ -1044,6 +1403,9 @@ static HRESULT WINAPI hook_VBUnlock(IDirect3DVertexBuffer8 *self)
                     do_pos = 0;
                     if (g_uiscale_strict2d) uv_off = 0;
                 }
+                if (g_census)
+                    census_rhw_hit(g_rhw_reason, do_pos, uv_off != 0, count,
+                                   fvf, g_vb_write.data, stride, 0, count);
                 if (do_pos || uv_off) {
                     scale_rhw_verts(g_vb_write.data, stride, 0, count,
                                     do_pos, uv_off);
@@ -1078,6 +1440,9 @@ static const void *uiscale_scale_rhw(const void *data, UINT stride,
         do_pos = 0;
         if (g_uiscale_strict2d) uv_off = 0;
     }
+    if (g_census)
+        census_rhw_hit(g_rhw_reason, do_pos, uv_off != 0, count, g_cur_fvf,
+                       data, stride, first, count);
     if (!do_pos && !uv_off)
         return NULL;
     memcpy(g_up_scratch, data, need);
@@ -1427,6 +1792,14 @@ static HRESULT WINAPI hook_SetTransform(IDirect3DDevice8 *self,
 {
     typedef HRESULT (WINAPI *st_t)(IDirect3DDevice8 *,
         D3DTRANSFORMSTATETYPE, CONST D3DMATRIX *);
+    /* Census: remember the live texture-stage matrices. A puddle/reflection
+     * that samples the frame in SCREEN space carries its screen size in this
+     * matrix, so comparing it between UIScale=0 and UIScale>1 shows directly
+     * whether the engine is addressing a 3840x2160 surface with 1920x1080
+     * arithmetic. */
+    if (g_census && pMatrix && State >= D3DTS_TEXTURE0 &&
+        State <= D3DTS_TEXTURE0 + 7)
+        g_tex_matrix[State - D3DTS_TEXTURE0] = *pMatrix;
     if (State == D3DTS_PROJECTION && pMatrix && g_proj_logs < 24) {
         g_proj_logs++;
         logf_("PROJ in: _11=%.6g _22=%.6g _33=%.6g _34=%.3g _43=%.6g "
@@ -1446,6 +1819,78 @@ static HRESULT WINAPI hook_SetTransform(IDirect3DDevice8 *self,
             return ((st_t)g_orig_settransform)(self, State, &m);
     }
     return ((st_t)g_orig_settransform)(self, State, pMatrix);
+}
+
+/* Blend-factor names, D3DBLEND_ZERO(1) .. D3DBLEND_INVDESTALPHA(8) and the
+ * BOTH* pair; anything else prints numerically. DESTALPHA/INVDESTALPHA are
+ * the ones that matter: they read the render target's alpha channel. */
+static const char *blend_name(DWORD b)
+{
+    static const char *n[] = { "?", "ZERO", "ONE", "SRCCOLOR", "INVSRCCOLOR",
+        "SRCALPHA", "INVSRCALPHA", "DESTALPHA", "INVDESTALPHA", "DESTCOLOR",
+        "INVDESTCOLOR", "SRCALPHASAT", "BOTHSRCALPHA", "BOTHINVSRCALPHA" };
+    return b < sizeof(n) / sizeof(n[0]) ? n[b] : "OTHER";
+}
+
+static const char *fmt_name(D3DFORMAT f)
+{
+    switch ((int)f) {
+    case D3DFMT_A8R8G8B8: return "A8R8G8B8";
+    case D3DFMT_X8R8G8B8: return "X8R8G8B8";
+    case D3DFMT_R5G6B5:   return "R5G6B5";
+    case D3DFMT_A1R5G5B5: return "A1R5G5B5";
+    case D3DFMT_X1R5G5B5: return "X1R5G5B5";
+    case D3DFMT_UNKNOWN:  return "UNKNOWN";
+    default:              return "fmt";
+    }
+}
+
+static void census_dump(void)
+{
+    logf_("--- census window (%u frames) ---", g_census_frames);
+    for (int i = 0; i < g_n_c_rt; i++) {
+        RtBucket *r = &g_c_rt[i];
+        logf_("  RT   %4ux%-4u %-9s(%d) %-11s binds=%u", r->w, r->h,
+              fmt_name(r->fmt), (int)r->fmt, r->bb ? "backbuffer" : "offscreen",
+              r->n);
+    }
+    for (int i = 0; i < g_n_c_blend; i++) {
+        BlendBucket *b = &g_c_blend[i];
+        int reads_dest_alpha =
+            b->ab && (b->src == D3DBLEND_DESTALPHA ||
+                      b->src == D3DBLEND_INVDESTALPHA ||
+                      b->dst == D3DBLEND_DESTALPHA ||
+                      b->dst == D3DBLEND_INVDESTALPHA);
+        int have_alpha = b->fmt == D3DFMT_A8R8G8B8 ||
+                         b->fmt == D3DFMT_A1R5G5B5;
+        logf_("  BLEND ab=%d src=%-12s dst=%-12s target=%-10s %-8s draws=%u%s",
+              b->ab, blend_name(b->src), blend_name(b->dst),
+              b->bb ? "backbuffer" : "offscreen", fmt_name(b->fmt), b->n,
+              reads_dest_alpha ? (have_alpha ? "  <= READS DEST ALPHA (ok)"
+                                             : "  <= READS DEST ALPHA ON A "
+                                               "TARGET WITHOUT ALPHA")
+                               : "");
+    }
+    for (int i = 0; i < g_n_c_rttex; i++) {
+        RtTexBucket *b = &g_c_rttex[i];
+        logf_("  RTTEX tex=%ux%-5u ab=%d src=%-12s dst=%-12s target=%-10s "
+              "draws=%u%s", b->tw, b->th, b->ab, blend_name(b->src),
+              blend_name(b->dst), b->bb ? "backbuffer" : "offscreen", b->n,
+              b->rewritten ? "  <= PostFilterAlphaFix REWROTE SRCBLEND TO ONE"
+                           : "");
+    }
+    for (int i = 0; i < g_n_c_rhw; i++) {
+        RhwBucket *b = &g_c_rhw[i];
+        static const char *why[] = { "SCALED", "rejected:device-bounds",
+            "rejected:projected", "rejected:stride" };
+        logf_("  RHW  %-22s verts=%-5u fvf=0x%03lx pos=%d uv=%d "
+              "x[%.0f..%.0f] y[%.0f..%.0f] draws=%u",
+              why[b->verdict & 3], b->verts, (unsigned long)b->fvf, b->pos,
+              b->uv, (double)b->x0, (double)b->x1, (double)b->y0,
+              (double)b->y1, b->n);
+    }
+    g_n_c_rt = g_n_c_blend = g_n_c_rhw = g_n_c_rttex = 0;
+    g_census_frames = 0;
 }
 
 static HRESULT WINAPI hook_Present(IDirect3DDevice8 *self,
@@ -1470,6 +1915,13 @@ static HRESULT WINAPI hook_Present(IDirect3DDevice8 *self,
         QueryPerformanceCounter(&t1);
         drawstats_frame(t0, t1);
     }
+    /* Frame over. Go back to the LAYOUT resolution: the engine lays its 2D
+     * layer out before it draws it — a flip at the first 2D draw is too late
+     * and leaves the HUD unscaled — so the layout value is the resting state,
+     * and the real resolution is asserted only across the 3D draw span. */
+    g_phase_3d_seen = 0;
+    set_ui_phase(1);
+    if (g_census && ++g_census_frames >= CENSUS_WINDOW) census_dump();
     /* One displayed frame just finished; let plugins pace the frame rate
      * (the engine's simulation is frame-time bound). */
     for (int i = 0; i < g_n_hooks; i++)
@@ -1494,7 +1946,10 @@ static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
         logf_("Reset applied:   %ux%u fmt=%d windowed=%d",
               pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat,
               pp->Windowed);
-    if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
+    if (pp) {
+        g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight;
+        g_bb_fmt = pp->BackBufferFormat;
+    }
     /* The old swapchain (and the game's default-pool textures) die in the
      * Reset whether or not it succeeds — forget them before forwarding. */
     forget_device_objects();
@@ -1582,7 +2037,10 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
 
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface &&
         *ppReturnedDeviceInterface) {
-        if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
+        if (pp) {
+            g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight;
+            g_bb_fmt = pp->BackBufferFormat;
+        }
         /* On a device RECREATION (the engine's fallback when a Reset fails,
          * and its normal path for some settings changes) everything cached
          * from the old device is dangling — never touch it, just forget it. */
@@ -1609,6 +2067,13 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
                    (void *)hook_SetRenderTarget, &g_orig_setrendertarget);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETTEXTURE,
                    (void *)hook_SetTexture, &g_orig_settexture);
+        if (g_census) {
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_CLEAR,
+                       (void *)hook_Clear, &g_orig_clear);
+            patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETTEXSTAGESTATE,
+                       (void *)hook_SetTextureStageState,
+                       &g_orig_settexstagestate);
+        }
         capture_backbuffer(*ppReturnedDeviceInterface);
         if (g_postfx_alpha_fix) {
             patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETRENDERSTATE,
@@ -1916,7 +2381,9 @@ __declspec(dllexport) void WINAPI HMC_RegisterD3D8Hooks(
     HMCD3D8Hooks *h = &g_hooks[g_n_hooks++];
     memset(h, 0, sizeof(*h));
     size_t v3_size = offsetof(HMCD3D8Hooks, fix_viewport);
-    memcpy(h, hooks, hooks->version >= 4 ? sizeof(*h) : v3_size);
+    size_t v4_size = offsetof(HMCD3D8Hooks, set_ui_phase);
+    memcpy(h, hooks, hooks->version >= 5 ? sizeof(*h) :
+                     (hooks->version >= 4 ? v4_size : v3_size));
     logf_("plugin #%d registered D3D8 hooks v%u (fix_present=%p "
           "fix_projection=%p on_device=%p on_frame=%p on_present=%p "
           "fix_viewport=%p)", g_n_hooks, hooks->version,
@@ -2017,10 +2484,33 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
                                               sizeof(v)) && v[0] == '1';
         int pfx_file = GetFileAttributesA(pfx_marker) != INVALID_FILE_ATTRIBUTES;
         int pfx_ini = read_postfx_alpha_ini();
-        if (pfx_env || pfx_file || pfx_ini) {
+        /* Both post-filter alpha workarounds exist for ONE defect, and it is
+         * not a defect of Direct3D: on the CrossOver D3D->Metal stack an A8
+         * render target comes back with alpha ~0 for opaque geometry, which
+         * zeroes the bloom bright-pass (it multiplies scene colour by that
+         * alpha) and the composite's SRCALPHA weight. Native D3D8 writes the
+         * alpha the engine asks for, so on a native-Windows host there is
+         * nothing to work around — and applying the workarounds anyway is
+         * itself a rendering bug of exactly the kind d8aba77/c743843 fixed:
+         * PostFilterOpaqueRT drops the alpha channel of two post-filter render
+         * targets, so the bright-pass mask reads 1.0 everywhere instead of the
+         * per-material alpha the artists tuned (verified in-game: the maps
+         * that use the destination-alpha ground/detail blend are exactly the
+         * ones that show it), and PostFilterAlphaFix rewrites a blend factor
+         * the engine chose. So the ini keys are host-gated: they configure the
+         * Wine/CrossOver path only. The HMC_* environment variables still
+         * force them anywhere, which keeps the A/B diagnostic available on
+         * either host. */
+        int host_needs_postfx_workarounds = is_wine_host();
+        if (pfx_ini && !host_needs_postfx_workarounds && !pfx_env && !pfx_file)
+            logf_("PostFilterAlphaFix requested but INERT on this host: it "
+                  "works around a CrossOver D3D->Metal alpha defect that "
+                  "native Direct3D does not have (HMC_POSTFX_ALPHA_FIX=1 "
+                  "forces it for A/B testing)");
+        if (pfx_env || pfx_file || (pfx_ini && host_needs_postfx_workarounds)) {
             g_postfx_alpha_fix = 1;
             logf_("PostFilterAlphaFix ENABLED (%s)",
-                  pfx_ini ? "hmc_display.ini" :
+                  pfx_ini && host_needs_postfx_workarounds ? "hmc_display.ini" :
                   (pfx_file ? "scripts/POSTFX_ALPHA_FIX marker" :
                    "HMC_POSTFX_ALPHA_FIX=1"));
         }
@@ -2035,7 +2525,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         int pfox_env = GetEnvironmentVariableA("HMC_POSTFX_OPAQUE_RT", v,
                                                sizeof(v)) && v[0] == '1';
         int pfox_ini = read_int_ini("PostFilterOpaqueRT", 0);
-        if (pfox_env || pfox_ini) {
+        if (pfox_ini && !host_needs_postfx_workarounds && !pfox_env)
+            logf_("PostFilterOpaqueRT requested but INERT on this host: the "
+                  "post-filter render targets keep the A8R8G8B8 the engine "
+                  "asks for, so the bloom bright-pass reads the engine's own "
+                  "alpha mask (HMC_POSTFX_OPAQUE_RT=1 forces it for A/B "
+                  "testing)");
+        if (pfox_env || (pfox_ini && host_needs_postfx_workarounds)) {
             g_postfx_opaque_rt = 1;
             /* Optional subset mask. Default 0x3f = all six sites (legacy). Set a
              * value with the death-grade buffer's bit clear to keep bloom X8
@@ -2046,6 +2542,17 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             logf_("PostFilterOpaqueRT ENABLED (%s), site mask 0x%02x",
                   pfox_ini ? "hmc_display.ini" : "HMC_POSTFX_OPAQUE_RT=1",
                   g_postfx_opaque_mask);
+        }
+        char cen_marker[MAX_PATH];
+        snprintf(cen_marker, sizeof(cen_marker), "%s\\scripts\\RENDERCENSUS",
+                 g_dir);
+        memset(v, 0, sizeof(v));
+        if ((GetEnvironmentVariableA("HMC_RENDERCENSUS", v, sizeof(v)) &&
+             v[0] == '1') ||
+            GetFileAttributesA(cen_marker) != INVALID_FILE_ATTRIBUTES) {
+            g_census = 1;
+            logf_("render census ENABLED (blend/RHW/RT buckets every %d "
+                  "frames)", CENSUS_WINDOW);
         }
         g_uiscale_strict2d = read_int_ini("UIScaleStrict2D", 1) != 0;
         if (!g_uiscale_strict2d)

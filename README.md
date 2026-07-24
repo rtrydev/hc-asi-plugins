@@ -278,13 +278,21 @@ in `HitmanContracts.ini` so the filter path runs (the installer restores it
 if a previous run zeroed it).
 
 Two companion options work around CrossOver D3DMetal quirks that would
-otherwise make the post-filter composite vanish or the textures go flat:
+otherwise make the post-filter composite vanish or the textures go flat.
+**Both are host-gated: they configure the Wine/CrossOver path only and do
+nothing on a native-Windows host.** They exist for one defect, and it is not
+a defect of Direct3D — on the D3D→Metal stack an A8 render target reads back
+with alpha ≈ 0 for opaque geometry, which zeroes the bloom bright-pass (it
+multiplies scene colour by that alpha) and the composite's `SRCALPHA` weight.
+Native D3D8 writes the alpha the engine asked for, so applying the
+workarounds there is itself a rendering bug — the same one the A8R8G8B8
+backbuffer fixes addressed, one level down (see *Alpha is the game's, on
+every surface* below).
 
-- `PostFilterOpaqueRT=1` (default): the game's backbuffer keeps its original
-  alpha-capable format (needed for detail-texture effects), but selected
-  post-filter render targets are created without alpha, so the bloom
-  bright-pass — which multiplies scene colour by the surface's alpha — isn't
-  zeroed out by the near-zero alpha D3DMetal leaves there.
+- `PostFilterOpaqueRT=1` (default): under Wine, the game's backbuffer keeps
+  its original alpha-capable format (needed for detail-texture effects) but
+  selected post-filter render targets are created without alpha, so the bloom
+  bright-pass isn't zeroed out by the near-zero alpha D3DMetal leaves there.
 - `PostFilterOpaqueRTMask=3` chooses which post-filter buffers that covers.
   The default covers exactly the two bloom buffers; the rest keep alpha
   because the dying/slow-motion black-and-white desaturation ramps through a
@@ -292,6 +300,31 @@ otherwise make the post-filter composite vanish or the textures go flat:
   at `3`.
 - `PostFilterAlphaFix` (off by default) is an older, blunter workaround for
   the same class of problem, kept for testing.
+
+`HMC_POSTFX_OPAQUE_RT=1` / `HMC_POSTFX_ALPHA_FIX=1` in the environment force
+either workaround on **any** host, which keeps the A/B comparison available
+on Windows too. The log says which way each one resolved.
+
+### Alpha is the game's, on every surface
+
+Contracts uses its render targets' alpha channel as data, not just as
+opacity: the ground/detail blend on many maps runs a pass with
+`SRCBLEND=INVDESTALPHA / DESTBLEND=DESTALPHA` (it reads back what earlier
+draws wrote), and the post-filter's bright-pass masks bloom by the scene's
+alpha. Any surface the plugins hand the engine must therefore carry the alpha
+channel the engine asked for. Three fixes, one rule:
+
+1. the windowed/borderless backbuffer keeps the requested `A8R8G8B8` instead
+   of being forced to the desktop's `X8R8G8B8`;
+2. the exclusive-fullscreen backbuffer does too, and the format is restored
+   across the in-game resolution switch (mode-list entries are always X8);
+3. the post-filter **render targets** keep it as well — that is the
+   host-gating above. Only the maps that use the destination-alpha technique
+   show the difference, which is why this survived a map-by-map check for so
+   long.
+
+The `RENDERCENSUS` diagnostic below reports which alpha technique a given map
+actually uses, so this is checkable rather than inferred.
 
 ### UI scaling (`UIScale`)
 
@@ -338,8 +371,20 @@ quads inside them, and rescaling the **texture coordinates** of draws that
 sample those full-size RTs (the engine computes them as layout-derived
 sub-rects; the content now fills the RT, so the UVs follow — full-range
 0..1 blits are unaffected by the scale-and-clamp). Device-space geometry
-(e.g. the video player's quads) is detected by its coordinates and left
-alone.
+(e.g. the video player's quads, and the post-filter's full-screen blits) is
+detected by **reaching the device extents** and left alone.
+
+That last test matters more than it looks. It used to be "any vertex past
+the layout rect is device space", which confuses *overshoot* with device
+space: the engine deliberately over-extends believed-space 2D quads past the
+layout rect so they cover regardless of rounding. The cinematic letterbox is
+the case that exposed it — the pair arrives as a top bar `y[0..134]` and a
+bottom bar `y[944..2024]` against a 1920x1080 layout, so the top bar scaled
+and the bottom bar did not, leaving the unscaled bottom bar as a 1920x1080
+**black rectangle in the middle of the screen, over whoever 47 was talking
+to** (reproducible on the Hong Kong missions' entrance dialogue). Believed
+space is laid out on the layout scale and only ever overshoots it; device
+space is built from the real display and therefore reaches it.
 
 Only in legacy positive-factor mode, the engine's believed-space **2D layer**
 may be rescaled. That layer
@@ -353,6 +398,75 @@ textures" of the old X8-backbuffer bug back in the same spots. Skipped
 draws log one-shot `UIScale: ... left unscaled` lines; `UIScaleStrict2D=0`
 restores the old bounds-only classification if a UI element ever stops
 scaling.
+
+### The temporal split (`UIScalePhaseSplit`)
+
+Re-believing the resolution *permanently* made the engine throw geometry away.
+Rainy exteriors — Hong Kong streets, the Hunter-and-Hunted roof — showed
+polygon-shaped "see-through" patches lining up with **water puddles**.
+Reproducible by booting `C09-1` directly and waiting ~45 s.
+
+The cause was **not** the alpha path and not a mis-projected texture. Measured,
+in this order:
+
+- unchanged with both post-filter alpha workarounds inert, and unchanged with
+  the post-filter forced off entirely (`UIScalePostFilter=0`);
+- no RHW draw is misclassified where it appears — the census shows only
+  full-screen device-space quads there;
+- the projected-texture matrices are **bit-identical** between `UIScale=0`
+  and `UIScale=2`, for both the 128x128 projected shadow
+  (`D3DTTFF_PROJECTED`, `TCI_CAMERASPACEPOSITION`) and the puddle reflection
+  (`TCI_CAMERASPACEREFLECTIONVECTOR`, sphere-map matrix) — so the engine's
+  projection math is not being corrupted;
+- but the **draw count is not**. Over the same scripted level intro, once 47
+  reaches the roof the two configurations sit on stable plateaus:
+  `UIScale=2` submits ~547 opaque scene draws/frame where `UIScale=0`
+  submits ~605. About 10% of the scene is never drawn.
+
+So the engine was culling geometry it should keep: its screen-size/LOD metric
+is computed against the re-believed 1920x1080 while the frame is really
+3840x2160, halving every projected size and pushing small pieces under the
+cull threshold. Puddles are what make it visible — a puddle is a separate
+transparent layer over its own ground patch, so when that patch is culled
+there is nothing opaque left and you look straight through to whatever is
+behind. `LevelOfDetail 2` / `DrawDistance 2.0` do not compensate.
+
+Bisecting the structural patch set (`scripts/UISCALE_SITES`, a hex mask over
+the matching pairs in scan order) pins the responsible value to **one** site:
+the pair at roughly `+0x383F5` from the packed `+0x71/+0x79` fields. That
+single value both makes the engine lay its HUD out at the divided size and
+feeds the cull metric, so the two jobs cannot be separated by choosing sites —
+patching it gives a correctly scaled HUD *and* the artifact, omitting it (mask
+`0x3` or `0xB`) gives a clean image *and* an unscaled HUD.
+
+`UIScalePhaseSplit=1` (the default) separates them in **time** instead. The
+loader reports which half of the frame the engine is in through the v5
+`set_ui_phase` hook, and the re-believed sites carry both pairs:
+
+- **layout resolution is the resting state** — it covers everything outside
+  the 3D draws, which is where the engine lays its 2D layer out;
+- **the real render resolution is asserted only across the 3D draw span**,
+  from the first transformed-vertex draw to the first pre-transformed one
+  after it, which is where traversal culls.
+
+The split point works because the engine draws the 3D scene with transformed
+vertices and everything after it — post-filter composite, HUD, menus — with
+pre-transformed RHW ones. A leading RHW backdrop cannot trip it early (the 2D
+phase only begins *after* a 3D draw), and a frame with no 3D at all (menus,
+loading) stays in the layout phase throughout. The viewport rescale follows
+automatically: a 3D-phase engine emits real-sized viewports, which fail the
+fits-inside-layout test and pass through untouched, while the 2D phase still
+emits layout-sized ones that get scaled.
+
+Note the resting state has to be the layout value, not the real one: flipping
+to layout at the first 2D *draw* is too late — the engine has already built
+its 2D geometry by then, and the HUD comes out unscaled.
+
+Verified at the same spot: the artifact is gone, the HUD is back to its
+scaled size, and the draw count returns to the un-re-believed baseline
+(609-628 opaque scene draws/frame against 605 at `UIScale=0`, where the
+permanently-divided build sat at 547). Frame time is unchanged — the hook
+fires at most twice per frame and writes five `uint32` pairs.
 
 Legacy-mode vertex-buffer UI quads are transformed in place at the end of the engine's
 existing write lock. This is deliberately not done by reopening buffers from
@@ -396,8 +510,10 @@ VSync=-1            ; -1 auto / 0 off => immediate present (the software cap
 BackBuffers=2       ; backbuffer count (2 => triple-buffered)
 PostFilterFullRes=1 ; full-resolution post-filter effects (needs
                     ; PostFilterLOD >= 1 in HitmanContracts.ini)
-PostFilterAlphaFix=0 ; older CrossOver workaround; leave off
-PostFilterOpaqueRT=1 ; CrossOver workaround so bloom survives; leave on
+PostFilterAlphaFix=0 ; older CrossOver workaround; leave off. Wine-only:
+                    ; inert on native Windows (see above)
+PostFilterOpaqueRT=1 ; CrossOver workaround so bloom survives; leave on.
+                    ; Wine-only: inert on native Windows (see above)
 PostFilterOpaqueRTMask=3 ; which buffers it covers; leave at 3 (see above)
 RainEmitCap=0       ; rain CPU limiter, quads per pass; 0 = off
 RainSystemCap=0     ; rain CPU limiter, systems per frame; 0 = off
@@ -410,6 +526,9 @@ UIScalePostFilter=1 ; keep the post-filter under UIScale (default); 0 =
                     ; force PostFilterLOD 0 in memory instead (fallback)
 UIScaleStrict2D=1   ; only rescale true 2D-layer draws (rhw==1, z in 0..1,
                     ; stride matching the FVF); 0 = old bounds-only test
+UIScalePhaseSplit=1 ; re-believe only around the 2D pass, so the engine's
+                    ; screen-space cull metric keeps the real resolution
+                    ; (default); 0 = permanently divided (drops geometry)
 ```
 
 Install output: loader `d3d8.dll` (game root); `scripts/hmc_display.asi` +
@@ -555,6 +674,34 @@ before launch. `scripts/hmc_asi_loader.log` then emits one line per 60-frame
 window with FPS, draw counts, vertex-buffer lock time, Present time and rain
 stats — enough to tell CPU submission cost apart from GPU/present cost when
 chasing a dip.
+
+### Render census (`RENDERCENSUS`)
+
+Enable with `HMC_RENDERCENSUS=1` or an empty `scripts/RENDERCENSUS` marker
+file. Every 300 frames `scripts/hmc_asi_loader.log` gets an aggregated
+snapshot of how the frame is actually built — enough to identify a visibility
+bug's mechanism from a log, without having to reach the spot in-game:
+
+- **RT** — every distinct render target bound, with size and format. This is
+  where a surface that lost its alpha channel shows up as `X8R8G8B8`.
+- **BLEND** — `(srcblend, destblend, alphablendenable)` × bound-target format,
+  with an explicit marker when a bucket **reads destination alpha** and
+  whether the target it runs against actually has an alpha channel. This is
+  what identifies the ground/detail technique per map: Hong Kong
+  (`SCENES/C08-*`) runs ~12 `INVDESTALPHA/DESTALPHA` draws per frame; the
+  last mission's hotel interior runs none — which is exactly why a fix
+  verified on one map can leave others broken.
+- **RTTEX** — draws that *sample* a render-target texture, bucketed by the
+  sampled size and its blend, flagged when `PostFilterAlphaFix` rewrote the
+  blend. Character shadows appear here as a small RT composited
+  `ZERO/INVSRCCOLOR`.
+- **RHW** — how the UIScale classifier ruled on every pre-transformed draw
+  (scaled, or rejected and why) with vertex count, FVF and screen bounds.
+  Scene geometry being rescaled as if it were the 2D layer would appear as a
+  large-vertex-count `SCALED` bucket.
+
+Buckets are fixed-size and allocation-free; with the census off the draw path
+is unchanged.
 
 ### x87 translation (`tests/difftest.c`)
 

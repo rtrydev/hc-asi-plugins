@@ -74,7 +74,7 @@ if [ ! -f "$GAME/scripts/hmc_display.ini" ]; then
         # ShowCPU=0 by default: the CPU-share breakdown suspends the game's
         # main thread to sample it, which costs frame time — set ShowCPU=1
         # only when you want the X87/GAME/REST diagnostic.
-        printf '[display]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=1\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=0\nUIScalePostFilter=1\nUIScaleStrict2D=1\n\n[profiler]\nEnabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n' \
+        printf '[display]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nPreserveAspect=1\nModernModes=1\nCursorFix=0\nFpsCap=60\nVSync=-1\nBackBuffers=2\nPostFilterFullRes=1\nPostFilterAlphaFix=0\nPostFilterOpaqueRT=1\nPostFilterOpaqueRTMask=3\nRainEmitCap=192\nRainSystemCap=32\nForceWinMouse=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=0\nUIScalePostFilter=1\nUIScaleStrict2D=1\nUIScalePhaseSplit=1\n\n[profiler]\nEnabled=1\nScale=1.0\nShowCPU=0\nOffsetX=8\nOffsetY=8\n' \
             > "$GAME/scripts/hmc_display.ini"
     fi
 fi

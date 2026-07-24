@@ -59,6 +59,19 @@ static void logf_(const char *fmt, ...)
 /* config (set by widescreen.c's parser before the device exists) */
 static float g_cfg_uiscale = 0.0f;    /* 0/1 off, -1 auto, >1 explicit */
 static unsigned g_patch_mask = ~0u;
+/* Diagnostic bisect of the structural patch set (HMC_UISCALE_NOALIGNED=1):
+ * patch only the packed/unaligned settings fields, leaving the allocation's
+ * ALIGNED mirrors at the real render resolution. Those mirrors were added so
+ * native Contracts lays the UI out at the divided size; if a mirror is also
+ * what the engine feeds to render-target-relative math, re-believing it is
+ * what misprojects a full-size render target onto the world. */
+static int g_skip_aligned;
+/* Bisect of the structural patch set: a scripts/UISCALE_SITES file whose
+ * contents are a hex mask selects which of the allocation's matching pairs
+ * are re-believed (bit i <-> i-th pair in scan order). Diagnostic only —
+ * absent file means "all", the shipped behaviour. */
+static unsigned g_struct_mask = ~0u;
+static int g_struct_seen;
 
 /* live state (set at CreateDevice/Reset via hmc_uiscale_setup) */
 static int      g_active;
@@ -66,9 +79,14 @@ static int      g_ini_w, g_ini_h;     /* believed (layout) resolution */
 static unsigned g_bb_w, g_bb_h;       /* real backbuffer */
 static double   g_kx = 1.0, g_ky = 1.0;
 static int      g_vp_logs;
-typedef struct { uint8_t *p; uint32_t a, b; } ReassertSite;
+/* Each re-believed site carries BOTH values: `a`/`b` is the layout (divided)
+ * pair the 2D layer must see, `ra`/`rb` the real render resolution the 3D pass
+ * must see. See hmc_uiscale_phase. */
+typedef struct { uint8_t *p; uint32_t a, b, ra, rb; } ReassertSite;
 static ReassertSite g_reassert[16];
 static int g_n_reassert;
+static int g_phase_layout = 1;   /* which pair is currently written */
+static int g_phase_split;        /* temporal split armed (UIScalePhaseSplit) */
 
 void hmc_uiscale_config(float uiscale)
 {
@@ -210,6 +228,37 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
     const float owf = (float)rw, ohf = (float)rh;
     const float nwf = (float)lw, nhf = (float)lh;
     uint8_t *exe = (uint8_t *)GetModuleHandleA(NULL);
+    /* Marker file next to the plugin, not an env var: the game is launched by
+     * Steam, which passes its own (already-fixed) environment on. */
+    char envv[8] = {0};
+    g_skip_aligned = GetEnvironmentVariableA("HMC_UISCALE_NOALIGNED", envv,
+                                             sizeof(envv)) && envv[0] == '1';
+    char path[MAX_PATH];
+    HMODULE self = GetModuleHandleA("hmc_display.asi");
+    char *sl = NULL;
+    if (self && GetModuleFileNameA(self, path, sizeof(path)))
+        sl = strrchr(path, '\\');
+    if (sl && (size_t)(sl - path) + 24 < sizeof(path)) {
+        if (!g_skip_aligned) {
+            strcpy(sl + 1, "UISCALE_NOALIGNED");
+            g_skip_aligned =
+                GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+        }
+        strcpy(sl + 1, "UISCALE_SITES");
+        FILE *f = fopen(path, "r");
+        if (f) {
+            unsigned m = ~0u;
+            if (fscanf(f, "%x", &m) == 1) {
+                g_struct_mask = m;
+                logf_("UISCALE_SITES: structural site mask 0x%x", m);
+            }
+            fclose(f);
+        }
+    }
+    g_struct_seen = 0;
+    if (g_skip_aligned)
+        logf_("HMC_UISCALE_NOALIGNED=1: patching only the packed/unaligned "
+              "settings fields (aligned mirrors keep the render resolution)");
     void *ui_alloc = g_patch_mask ? NULL :
         find_ui_settings_allocation(ow, oh, exe);
     MEMORY_BASIC_INFORMATION mbi;
@@ -244,6 +293,14 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                          * settings allocation. Patch its aligned mirrors too;
                          * they drive native viewport/UI layout. */
                         selected = ui_alloc && mbi.AllocationBase == ui_alloc;
+                        if (selected && g_skip_aligned &&
+                            !((uintptr_t)q & 3))
+                            selected = 0;   /* bisect: unaligned pairs only */
+                        if (selected) {
+                            int k = g_struct_seen++;
+                            if (k < 32 && !(g_struct_mask & (1u << k)))
+                                selected = 0;
+                        }
                     }
                     if (!selected) continue;
                     memcpy(q, &nw, 4);
@@ -251,7 +308,7 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                     if (g_n_reassert < (int)(sizeof(g_reassert) /
                                               sizeof(g_reassert[0]))) {
                         g_reassert[g_n_reassert++] =
-                            (ReassertSite){ q, nw, nh };
+                            (ReassertSite){ q, nw, nh, ow, oh };
                     }
                     if (ints + floats < 8)
                         logf_("re-believe int pair at %p%s%s",
@@ -274,10 +331,11 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
                         memcpy(q + 4, &nhf, 4);
                         if (g_n_reassert < (int)(sizeof(g_reassert) /
                                                   sizeof(g_reassert[0]))) {
-                            uint32_t a, b;
-                            memcpy(&a, &nwf, 4); memcpy(&b, &nhf, 4);
+                            uint32_t a, b, ra, rb;
+                            memcpy(&a, &nwf, 4);  memcpy(&b, &nhf, 4);
+                            memcpy(&ra, &owf, 4); memcpy(&rb, &ohf, 4);
                             g_reassert[g_n_reassert++] =
-                                (ReassertSite){ q, a, b };
+                                (ReassertSite){ q, a, b, ra, rb };
                         }
                         if (ints + floats < 8)
                             logf_("re-believe float pair at %p%s%s",
@@ -302,23 +360,72 @@ int hmc_uiscale_rebelieve(int rw, int rh, int lw, int lh)
 /* Native D3D8 relayouts after CreateDevice returns and can overwrite the
  * packed UI settings fields patched during the pre-device scan. Reapply only
  * those exact addresses; never rescan live D3D/device memory. */
-int hmc_uiscale_reassert(void)
+/* ---- temporal split (UIScalePhaseSplit) -------------------------------
+ *
+ * The engine reads ONE value for two unrelated jobs: it lays the 2D layer out
+ * against it, and it derives the screen-space size it culls/LODs geometry by
+ * from it. Re-believing it permanently gets the UI right and makes the engine
+ * throw away ~10% of the scene as "too small on screen" — measured at 547 vs
+ * 605 opaque draws per frame on the same spot, which is what the puddle
+ * see-through patches are: the ground patch under a puddle is culled, and the
+ * transparent puddle layer left on top shows whatever is behind it. Bisecting
+ * the patch set cannot separate the two jobs (scripts/UISCALE_SITES: the site
+ * that scales the HUD is the site that culls), so separate them in TIME
+ * instead — real resolution while the engine traverses and draws the 3D
+ * scene, layout resolution once it starts on the pre-transformed 2D layer.
+ *
+ * The loader drives this through the v5 set_ui_phase hook; the viewport
+ * rescale below follows automatically, because a 3D-phase engine now emits
+ * REAL-sized viewports (which fail the fits-inside-layout test and are passed
+ * through untouched) while the 2D phase still emits layout-sized ones. */
+void hmc_uiscale_phase(int layout_phase)
 {
-    int n = 0;
-    static int logged;
+    if (!g_active || !g_phase_split || layout_phase == g_phase_layout) return;
+    g_phase_layout = layout_phase;
     for (int i = 0; i < g_n_reassert; i++) {
         MEMORY_BASIC_INFORMATION mbi;
         if (VirtualQuery(g_reassert[i].p, &mbi, sizeof(mbi)) != sizeof(mbi) ||
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
             continue;
+        uint32_t a = layout_phase ? g_reassert[i].a : g_reassert[i].ra;
+        uint32_t b = layout_phase ? g_reassert[i].b : g_reassert[i].rb;
+        memcpy(g_reassert[i].p, &a, 4);
+        memcpy(g_reassert[i].p + 4, &b, 4);
+    }
+    static int logs;
+    if (logs < 2) {
+        logs++;
+        logf_("phase split: %s resolution asserted at %d site(s)",
+              layout_phase ? "layout" : "render", g_n_reassert);
+    }
+}
+
+void hmc_uiscale_phase_split(int on) { g_phase_split = on != 0; }
+
+int hmc_uiscale_reassert(void)
+{
+    int n = 0;
+    static int logged;
+    /* While the split is armed, the per-frame reassert must restore whichever
+     * pair the current phase wants — not unconditionally the layout one. */
+    for (int i = 0; i < g_n_reassert; i++) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(g_reassert[i].p, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            continue;
+        uint32_t want_a = (g_phase_split && !g_phase_layout) ?
+            g_reassert[i].ra : g_reassert[i].a;
+        uint32_t want_b = (g_phase_split && !g_phase_layout) ?
+            g_reassert[i].rb : g_reassert[i].b;
         uint32_t a, b;
         memcpy(&a, g_reassert[i].p, 4);
         memcpy(&b, g_reassert[i].p + 4, 4);
-        if (a == g_reassert[i].a && b == g_reassert[i].b)
+        if (a == want_a && b == want_b)
             continue;
-        memcpy(g_reassert[i].p, &g_reassert[i].a, 4);
-        memcpy(g_reassert[i].p + 4, &g_reassert[i].b, 4);
+        memcpy(g_reassert[i].p, &want_a, 4);
+        memcpy(g_reassert[i].p + 4, &want_b, 4);
         n++;
     }
     if (n && !logged) {
